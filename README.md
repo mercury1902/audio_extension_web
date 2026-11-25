@@ -21,3 +21,11 @@ A lightweight Manifest V3 Chrome extension for real-time **source bitrate inspec
 1. Clone this repository:
    ```bash
    git clone [https://github.com/mercury1902/audio_extension_web.git](https://github.com/mercury1902/audio_extension_web.git)
+
+Open Chrome and navigate to chrome://extensions.
+
+Enable Developer mode (top-right).
+
+Click Load unpacked and select the cloned folder (containing manifest.json).
+
+Reload any already-open media tabs (F5) so the MSE probe attaches before the player initializes.
