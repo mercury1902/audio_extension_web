@@ -1,0 +1,393 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Audio Bitrate Probe</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; border-radius: 0 !important; }
+    html, body {
+      width: 480px;
+      max-height: 596px;
+      overflow: hidden;
+      font-family: "Segoe UI", Tahoma, sans-serif;
+      font-size: 12px;
+      background: #202020;
+      color: #dcdcdc;
+      font-variant-numeric: tabular-nums;
+      user-select: none;
+    }
+    body {
+      display: flex;
+      flex-direction: column;
+    }
+
+    /* Native Win32 Dark Scrollbar */
+    ::-webkit-scrollbar { width: 11px; height: 11px; }
+    ::-webkit-scrollbar-track { background: #1c1c1c; border-left: 1px solid #303030; }
+    ::-webkit-scrollbar-thumb { background: #464646; border: 2px solid #1c1c1c; }
+    ::-webkit-scrollbar-thumb:hover { background: #5e5e5e; }
+
+    /* Native Win32 / foobar2000 Pinned Top Toolbar */
+    .toolbar {
+      flex-shrink: 0;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: #252525;
+      border-bottom: 1px solid #3c3c3c;
+      padding: 6px 10px;
+      gap: 6px;
+    }
+    .toolbar-left {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      min-width: 0;
+    }
+    .app-title {
+      font-size: 12px;
+      font-weight: 700;
+      color: #eaeaea;
+      letter-spacing: 0.2px;
+    }
+    .codec-tag {
+      padding: 1px 6px;
+      font-size: 10.5px;
+      font-weight: 700;
+      background: #181818;
+      color: #5294cf;
+      border: 1px solid #3c3c3c;
+    }
+
+    /* Native Flat Buttons */
+    button {
+      font-family: "Segoe UI", Tahoma, sans-serif;
+      border: 1px solid #4a4a4a;
+      background: #2e2e2e;
+      color: #e2e2e2;
+      padding: 3px 10px;
+      font-size: 11px;
+      font-weight: 600;
+      cursor: pointer;
+      line-height: 1.3;
+    }
+    button:hover { background: #3b3b3b; border-color: #606060; }
+    button:active { background: #1e1e1e; }
+    .btn-primary {
+      background: #1a6db8;
+      border-color: #368be0;
+      color: #ffffff;
+    }
+    .btn-primary:hover { background: #207dd1; border-color: #52a4f5; }
+    .btn-danger {
+      background: #8e2828;
+      border-color: #b83b3b;
+      color: #ffffff;
+    }
+    .btn-danger:hover { background: #a83232; border-color: #d44a4a; }
+    .btn-ghost { background: #2b2b2b; border-color: #464646; color: #d8d8d8; }
+
+    /* Scrollable Main Workspace */
+    .workspace {
+      flex: 1;
+      min-height: 0;
+      overflow-y: auto;
+      padding: 8px 10px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .live-view {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    /* Track Header Bar (foobar2000 blue group header style) */
+    .track-bar {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: #5294cf;
+      padding: 1px 0;
+      white-space: nowrap;
+      overflow: hidden;
+    }
+    .track-bar-text {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      font-weight: 600;
+    }
+    .track-artist { color: #9c9c9c; font-weight: 400; }
+    .track-bar::after {
+      content: "";
+      flex: 1;
+      height: 1px;
+      background: #3a4f66;
+      min-width: 14px;
+    }
+
+    /* Native Pane Container */
+    .pane {
+      background: #1b1b1b;
+      border: 1px solid #3a3a3a;
+    }
+    .pane-tabbar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: #252525;
+      border-bottom: 1px solid #3a3a3a;
+      padding: 4px 7px;
+      min-height: 26px;
+    }
+    .pane-tab {
+      font-size: 10.5px;
+      font-weight: 700;
+      color: #d4d4d4;
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+    }
+    .pane-tab-sub {
+      font-size: 10.5px;
+      color: #5294cf;
+      font-weight: 700;
+    }
+    .pane-tab-muted {
+      font-size: 10px;
+      color: #828282;
+      font-weight: 400;
+    }
+    .pane-body { padding: 7px; }
+
+    /* Compact 3-Column Metrics Table */
+    .metrics-table {
+      display: grid;
+      grid-template-columns: 1.55fr 1fr 1fr;
+      background: #1b1b1b;
+      border: 1px solid #3a3a3a;
+    }
+    .metric-cell {
+      padding: 6px 9px;
+      border-right: 1px solid #333333;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+    }
+    .metric-cell:last-child { border-right: none; }
+    .metric-label {
+      font-size: 9.5px;
+      color: #8c8c8c;
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+    }
+    .metric-val-lg {
+      font-size: 21px;
+      font-weight: 700;
+      color: #5294cf;
+      line-height: 1.15;
+      margin-top: 1px;
+    }
+    .metric-val-lg .unit { font-size: 11px; font-weight: 400; color: #969696; }
+    .metric-tier {
+      font-size: 10.5px;
+      color: #a6a6a6;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      margin-top: 1px;
+    }
+    .metric-val {
+      font-size: 14px;
+      font-weight: 700;
+      color: #e6e6e6;
+      margin-top: 3px;
+    }
+
+    /* Bitrate 12-segment Canvas */
+    canvas#bitrateCanvas {
+      width: 100%;
+      height: 38px;
+      display: block;
+      background: #181818;
+      border: 1px solid #2e2e2e;
+    }
+
+    /* FFT Spectrum & Waterfall Canvases */
+    .fft-controls { display: flex; gap: 5px; }
+    canvas#fftCanvas {
+      width: 100%;
+      height: 120px;
+      display: block;
+      background: #181818;
+      border: 1px solid #2e2e2e;
+    }
+    canvas#wfCanvas {
+      width: 100%;
+      height: 156px;
+      display: block;
+      background: #181818;
+      border: 1px solid #2e2e2e;
+    }
+
+    .fft-meta-strip {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      background: #222222;
+      border: 1px solid #333333;
+      border-top: none;
+      font-size: 11px;
+      color: #a8a8a8;
+    }
+    .fft-meta-cell {
+      padding: 4px 7px;
+      border-right: 1px solid #333333;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .fft-meta-cell:last-child { border-right: none; text-align: right; }
+    .fft-meta-cell strong { color: #e6e6e6; }
+
+    .verdict {
+      margin-top: 6px;
+      padding: 6px 8px;
+      font-size: 11px;
+      font-weight: 600;
+      line-height: 1.35;
+      background: #161616;
+      border: 1px solid #333333;
+      border-left: 3px solid #666666;
+      color: #c8c8c8;
+    }
+    .verdict.good { border-left-color: #3da35d; color: #8ad8a0; }
+    .verdict.ok { border-left-color: #5294cf; color: #96c7f2; }
+    .verdict.warn { border-left-color: #d6932d; color: #f0c678; }
+    .verdict.fake { border-left-color: #cf4646; color: #f29696; }
+
+    .empty {
+      padding: 12px 10px;
+      background: #1b1b1b;
+      border: 1px solid #3a3a3a;
+      color: #9e9e9e;
+      font-size: 11.5px;
+      line-height: 1.45;
+      text-align: center;
+    }
+
+    /* Native foobar2000 Pinned Bottom Status Bar */
+    .statusbar {
+      flex-shrink: 0;
+      background: #181818;
+      border-top: 1px solid #3c3c3c;
+      padding: 4px 10px;
+      font-size: 10.5px;
+      color: #a6a6a6;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+    }
+    .status-line {
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .status-mime { color: #7e7e7e; font-size: 10px; }
+
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <div class="toolbar">
+    <div class="toolbar-left">
+      <span class="app-title">Audio Bitrate Probe</span>
+      <span id="codecPill" class="codec-tag">IDLE</span>
+    </div>
+    <button id="btnOpenDashboard" class="btn-ghost" title="Open Multi-Tab Dashboard">Dashboard ↗</button>
+  </div>
+
+  <div class="workspace">
+    <div id="trackBar" class="track-bar hidden">
+      <span class="track-bar-text"><span id="trackTitle">—</span> <span id="trackArtist" class="track-artist"></span></span>
+    </div>
+
+    <div id="emptyState" class="empty">
+      No MSE audio stream detected on this tab.<br />
+      Press <strong>F5</strong> to reload and play audio (FFT Spectrum &amp; Waterfall below still work).
+    </div>
+
+    <div id="liveView" class="live-view hidden">
+      <div class="metrics-table">
+        <div class="metric-cell">
+          <div class="metric-label">Rolling Avg</div>
+          <div class="metric-val-lg"><span id="avgVal">0</span> <span class="unit">kbps</span></div>
+          <div id="tierText" class="metric-tier">—</div>
+        </div>
+        <div class="metric-cell">
+          <div class="metric-label">Instant</div>
+          <div id="instantVal" class="metric-val">—</div>
+        </div>
+        <div class="metric-cell">
+          <div class="metric-label">Peak</div>
+          <div id="peakVal" class="metric-val">—</div>
+        </div>
+      </div>
+
+      <div class="pane">
+        <div class="pane-tabbar">
+          <span class="pane-tab">Last 12 Segments</span>
+          <span id="chartHoverVal" class="pane-tab-sub"></span>
+        </div>
+        <div class="pane-body">
+          <canvas id="bitrateCanvas" width="436" height="38"></canvas>
+        </div>
+      </div>
+    </div>
+
+    <!-- Layer 2A: foobar2000-style FFT Spectrum -->
+    <div class="pane">
+      <div class="pane-tabbar">
+        <span class="pane-tab">Spectrum (FFT + Max-Hold)</span>
+        <div class="fft-controls">
+          <button id="btnResetFft" class="btn-ghost hidden">Reset</button>
+          <button id="btnToggleFft" class="btn-primary">Start FFT</button>
+        </div>
+      </div>
+      <div class="pane-body">
+        <canvas id="fftCanvas" width="436" height="120"></canvas>
+        <div class="fft-meta-strip">
+          <div class="fft-meta-cell">Cutoff: <strong id="cutoffVal">—</strong></div>
+          <div class="fft-meta-cell">Time: <strong id="sampleTimeVal">0.0s</strong></div>
+          <div class="fft-meta-cell"><strong id="srVal">— kHz</strong></div>
+        </div>
+        <div id="verdictBox" class="verdict">
+          Click <strong>Start FFT</strong> while audio is playing to inspect spectrum &amp; Spek waterfall.
+        </div>
+      </div>
+    </div>
+
+    <!-- Layer 2B: Spek-style Waterfall Spectrogram -->
+    <div class="pane">
+      <div class="pane-tabbar">
+        <span class="pane-tab">Waterfall Spectrogram (Spek)</span>
+        <span class="pane-tab-muted">Time-Frequency Heatmap</span>
+      </div>
+      <div class="pane-body">
+        <canvas id="wfCanvas" width="436" height="156"></canvas>
+      </div>
+    </div>
+  </div>
+
+  <div class="statusbar">
+    <div id="statusSummary" class="status-line">IDLE | Waiting for MSE audio stream...</div>
+    <div id="metaBox" class="status-line status-mime hidden">
+      <span id="mimeVal">—</span> | Chunk: <span id="chunkInfo">—</span>
+    </div>
+  </div>
+
+  <script src="bitrate_chart.js"></script>
+  <script src="popup.js"></script>
+</body>
+</html>

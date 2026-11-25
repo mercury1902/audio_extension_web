@@ -1,0 +1,29 @@
+{
+  "manifest_version": 3,
+  "name": "Audio Bitrate Probe",
+  "version": "0.5.1",
+  "description": "Monitor real-time MSE audio codec, source bitrate, and parallel FFT + Waterfall (Spek) spectrograms across multiple tabs.",
+  "permissions": ["storage", "tabCapture", "offscreen", "activeTab", "tabs"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Audio Bitrate Probe v0.5.1",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["inject_main.js"],
+      "run_at": "document_start",
+      "world": "MAIN",
+      "all_frames": true
+    },
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content_bridge.js"],
+      "run_at": "document_start",
+      "all_frames": true
+    }
+  ]
+}

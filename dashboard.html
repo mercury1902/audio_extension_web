@@ -1,0 +1,520 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Audio Monitor Dashboard [Audio Bitrate Probe]</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; border-radius: 0 !important; }
+    html, body { height: 100%; }
+    body {
+      font-family: "Segoe UI", Tahoma, sans-serif;
+      font-size: 12px;
+      background: #202020;
+      color: #dcdcdc;
+      display: flex;
+      flex-direction: column;
+      min-height: 100vh;
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* Native Win32 Dark Scrollbar */
+    ::-webkit-scrollbar { width: 12px; height: 12px; }
+    ::-webkit-scrollbar-track { background: #1c1c1c; border-left: 1px solid #303030; }
+    ::-webkit-scrollbar-thumb { background: #444444; border: 2px solid #1c1c1c; }
+    ::-webkit-scrollbar-thumb:hover { background: #5a5a5a; }
+
+    /* Top Native Toolbar */
+    .topbar {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 10px;
+      background: #252525;
+      border-bottom: 1px solid #3c3c3c;
+      padding: 6px 14px;
+    }
+    .brand { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; }
+    .brand h1 { font-size: 13.5px; font-weight: 700; color: #ececec; letter-spacing: 0.2px; }
+    .brand p { font-size: 11px; color: #8c8c8c; }
+    .actions { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+
+    button {
+      font-family: "Segoe UI", Tahoma, sans-serif;
+      border: 1px solid #4a4a4a;
+      background: #2e2e2e;
+      color: #e2e2e2;
+      padding: 4px 11px;
+      font-size: 11.5px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button:hover { background: #3b3b3b; border-color: #626262; }
+    button:active { background: #1e1e1e; }
+    .btn-primary {
+      background: #1a6db8;
+      border-color: #368be0;
+      color: #ffffff;
+    }
+    .btn-primary:hover { background: #207dd1; border-color: #52a4f5; }
+    .btn-danger {
+      background: #8e2828;
+      border-color: #b83b3b;
+      color: #ffffff;
+    }
+    .btn-danger:hover { background: #a83232; border-color: #d44a4a; }
+    .btn-ghost { background: #2b2b2b; border-color: #464646; color: #d8d8d8; }
+    .btn-accent {
+      background: #22354a;
+      border-color: #4274a3;
+      color: #8cc2f2;
+    }
+    .btn-accent:hover { background: #2b4561; border-color: #5ca0de; }
+    .btn-sm { padding: 3px 8px; font-size: 11px; }
+
+    label.toggle {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 11.5px;
+      color: #d0d0d0;
+      background: #1b1b1b;
+      padding: 4px 9px;
+      border: 1px solid #444444;
+      cursor: pointer;
+      user-select: none;
+    }
+    label.toggle input { accent-color: #1a82dc; }
+
+    /* Main Workspace */
+    .workspace {
+      flex: 1;
+      max-width: 1440px;
+      width: 100%;
+      margin: 0 auto;
+      padding: 12px 16px 18px;
+    }
+
+    /* Compact Native Stats Strip (4-cell horizontal bar) */
+    .stats-strip {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      background: #1a1a1a;
+      border: 1px solid #3a3a3a;
+      margin-bottom: 16px;
+    }
+    @media (max-width: 720px) {
+      .stats-strip { grid-template-columns: repeat(2, 1fr); }
+    }
+    .stat-card {
+      padding: 8px 12px;
+      border-right: 1px solid #303030;
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+    }
+    .stat-card:last-child { border-right: none; }
+    .stat-label { font-size: 10.5px; color: #8c8c8c; text-transform: uppercase; letter-spacing: 0.3px; }
+    .stat-value { font-size: 16px; font-weight: 700; color: #5294cf; }
+
+    /* Classic foobar2000 Blue Group Header with Extended Horizontal Line */
+    .section-head {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-bottom: 10px;
+    }
+    .section-title {
+      font-size: 12.5px;
+      font-weight: 600;
+      color: #5294cf;
+      white-space: nowrap;
+    }
+    .section-line {
+      flex: 1;
+      height: 1px;
+      background: #3a4f66;
+    }
+
+    /* Multi-Tab Grid (Sharp Desktop Panes) */
+    .tabs-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(340px, 1fr));
+      gap: 10px;
+      margin-bottom: 18px;
+    }
+    .tab-card {
+      background: #1b1b1b;
+      border: 1px solid #3c3c3c;
+      display: flex;
+      flex-direction: column;
+    }
+    .tab-card.is-live { border-color: #4d88bf; }
+    .tab-card.is-paused { opacity: 0.82; }
+
+    .tab-card-titlebar {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      background: #262626;
+      border-bottom: 1px solid #383838;
+      padding: 5px 8px;
+    }
+    .tab-card.is-live .tab-card-titlebar { background: #29313a; border-bottom-color: #3e5266; }
+
+    .tab-icon {
+      width: 16px;
+      height: 16px;
+      background: #181818;
+      flex-shrink: 0;
+      object-fit: contain;
+    }
+    .tab-info { flex: 1; min-width: 0; }
+    .tab-title {
+      font-size: 12px;
+      font-weight: 700;
+      color: #ececec;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .tab-sub {
+      font-size: 10.5px;
+      color: #969696;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .tab-card-body {
+      padding: 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 7px;
+      flex: 1;
+    }
+
+    .badges { display: flex; gap: 4px; flex-wrap: wrap; align-items: center; }
+    .pill {
+      padding: 1px 6px;
+      font-size: 10px;
+      font-weight: 700;
+      border: 1px solid #444444;
+      background: #242424;
+      color: #cccccc;
+    }
+    .pill-live { background: #1a2d1f; color: #67d188; border-color: #2f5e3b; }
+    .pill-paused { background: #242424; color: #8c8c8c; border-color: #3c3c3c; }
+    .pill-muted { background: #331c1c; color: #e87676; border-color: #633131; }
+    .pill-codec { background: #1a2633; color: #6bb2ed; border-color: #345270; }
+    .pill-nonmse { background: #302616; color: #e6b865; border-color: #5e4a26; }
+    .pill-probe { background: #2c1e33; color: #cf9be8; border-color: #573a66; }
+
+    .metrics-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: #161616;
+      border: 1px solid #303030;
+      padding: 6px 9px;
+    }
+    .big-kbps { font-size: 21px; font-weight: 700; color: #5294cf; }
+    .big-kbps span { font-size: 11px; font-weight: 400; color: #8c8c8c; }
+    .mini-stats { text-align: right; font-size: 11px; color: #b8b8b8; line-height: 1.4; }
+    .mini-stats strong { color: #ececec; }
+
+    .spark-wrap {
+      background: #161616;
+      border: 1px solid #303030;
+      padding: 4px 5px;
+    }
+    .spark-head {
+      display: flex;
+      justify-content: space-between;
+      font-size: 9.5px;
+      color: #808080;
+      margin-bottom: 3px;
+      text-transform: uppercase;
+    }
+    .spark-hover { color: #6bb2ed; font-weight: 700; }
+    canvas.spark-canvas { width: 100%; height: 34px; display: block; }
+
+    .mime-line {
+      font-size: 10.5px;
+      color: #7d7d7d;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .card-footer {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 6px;
+      background: #232323;
+      border-top: 1px solid #343434;
+      padding: 5px 8px;
+      flex-wrap: wrap;
+    }
+    .card-footer-left { display: flex; gap: 5px; }
+
+    .empty-grid {
+      grid-column: 1 / -1;
+      background: #1b1b1b;
+      border: 1px solid #3a3a3a;
+      padding: 24px 16px;
+      text-align: center;
+      color: #8c8c8c;
+      font-size: 12.5px;
+      line-height: 1.55;
+    }
+
+    /* Multi-Tab Dual-Chart FFT Stack */
+    .probes-stack {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .probe-card {
+      background: #1b1b1b;
+      border: 1px solid #3c3c3c;
+      display: flex;
+      flex-direction: column;
+    }
+    .probe-head {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      align-items: center;
+      gap: 8px;
+      background: #262626;
+      border-bottom: 1px solid #3a3a3a;
+      padding: 5px 10px;
+    }
+    .probe-title-wrap {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      min-width: 0;
+      flex: 1;
+    }
+    .probe-badge {
+      padding: 1px 6px;
+      font-size: 10.5px;
+      font-weight: 700;
+      background: #1a2633;
+      color: #6bb2ed;
+      border: 1px solid #3a5b7a;
+      flex-shrink: 0;
+    }
+    .probe-badge.is-popup {
+      background: #2c1e33;
+      color: #cf9be8;
+      border-color: #573a66;
+    }
+    .probe-name {
+      font-size: 12.5px;
+      font-weight: 700;
+      color: #ececec;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .probe-controls {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 6px;
+    }
+    select.probe-link-select {
+      font-family: "Segoe UI", Tahoma, sans-serif;
+      background: #181818;
+      color: #dcdcdc;
+      border: 1px solid #4a4a4a;
+      padding: 3px 6px;
+      font-size: 11px;
+      max-width: 240px;
+      outline: none;
+    }
+    select.probe-link-select:focus { border-color: #5294cf; }
+
+    .probe-body {
+      padding: 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    /* Dual Charts Side-by-Side (Native Split Panes) */
+    .dual-charts {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+    @media (max-width: 920px) {
+      .dual-charts { grid-template-columns: 1fr; }
+    }
+    .chart-pane {
+      background: #181818;
+      border: 1px solid #363636;
+      display: flex;
+      flex-direction: column;
+    }
+    .chart-pane-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      background: #242424;
+      border-bottom: 1px solid #363636;
+      padding: 3px 8px;
+      font-size: 10.5px;
+      font-weight: 700;
+      color: #cccccc;
+      text-transform: uppercase;
+      letter-spacing: 0.3px;
+    }
+    .chart-pane-sub {
+      font-size: 10px;
+      font-weight: 400;
+      color: #828282;
+      text-transform: none;
+    }
+    canvas.probe-canvas {
+      width: 100%;
+      height: 186px;
+      display: block;
+      background: #181818;
+    }
+
+    .fft-meta {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      background: #222222;
+      border: 1px solid #343434;
+      font-size: 11.5px;
+      color: #a8a8a8;
+    }
+    @media (max-width: 720px) {
+      .fft-meta { grid-template-columns: repeat(2, 1fr); }
+    }
+    .fft-meta-item {
+      padding: 4px 8px;
+      border-right: 1px solid #343434;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .fft-meta-item:last-child { border-right: none; }
+    .fft-meta strong { color: #ececec; }
+
+    .verdict {
+      padding: 6px 10px;
+      font-size: 11.5px;
+      font-weight: 600;
+      background: #161616;
+      border: 1px solid #343434;
+      border-left: 3px solid #666666;
+      color: #cccccc;
+    }
+    .verdict.good { border-left-color: #3da35d; color: #8ad8a0; }
+    .verdict.ok { border-left-color: #5294cf; color: #96c7f2; }
+    .verdict.warn { border-left-color: #d6932d; color: #f0c678; }
+    .verdict.fake { border-left-color: #cf4646; color: #f29696; }
+
+    .probes-empty {
+      background: #1b1b1b;
+      border: 1px solid #3a3a3a;
+      padding: 22px 18px;
+      text-align: center;
+      color: #969696;
+      font-size: 12.5px;
+      line-height: 1.6;
+    }
+    .probes-empty-actions { margin-top: 10px; }
+
+    /* Native foobar2000 Bottom Status Bar */
+    .statusbar {
+      background: #181818;
+      border-top: 1px solid #3c3c3c;
+      padding: 4px 14px;
+      font-size: 11px;
+      color: #a8a8a8;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .hidden { display: none; }
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <div class="brand">
+      <h1>Audio Monitor Dashboard</h1>
+      <p>[Audio Bitrate Probe — Multi-Tab MSE &amp; Spectral Analyzer]</p>
+    </div>
+    <div class="actions">
+      <label class="toggle">
+        <input type="checkbox" id="chkOnlyAudible" />
+        Audible tabs only
+      </label>
+      <button id="btnRefresh" class="btn-ghost">Refresh</button>
+      <button id="btnPickFft" class="btn-primary">+ Add FFT Probe</button>
+    </div>
+  </div>
+
+  <div class="workspace">
+    <div class="stats-strip">
+      <div class="stat-card">
+        <span class="stat-label">Audible Tabs</span>
+        <span id="statAudible" class="stat-value">0</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">MSE Streams</span>
+        <span id="statMse" class="stat-value">0</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">FFT Probes</span>
+        <span id="statProbes" class="stat-value">0</span>
+      </div>
+      <div class="stat-card">
+        <span class="stat-label">Peak Stream</span>
+        <span id="statMaxKbps" class="stat-value">—</span>
+      </div>
+    </div>
+
+    <div class="section-head">
+      <div class="section-title">Active Audio Tabs</div>
+      <div class="section-line"></div>
+    </div>
+    <div id="tabsGrid" class="tabs-grid"></div>
+
+    <div class="section-head">
+      <div class="section-title">Multi-Tab Spectral Analyzers (Spectrum + Spek Waterfall)</div>
+      <div class="section-line"></div>
+      <button id="btnStopAllFft" class="btn-danger btn-sm hidden">Stop All</button>
+    </div>
+
+    <div id="probesEmpty" class="probes-empty">
+      No active spectral probes.<br />
+      Click <strong>+ Add FFT Probe</strong> (or <strong>Probe FFT</strong> on any tab panel above) to display both <strong>Spectrum (FFT + Max-Hold)</strong> and <strong>Waterfall (Spek)</strong> side-by-side for multiple tabs.<br />
+      <span style="font-size:11px; color:#757575;">Tip: In Chrome's picker, choose a tab under <em>Chrome Tab</em> and keep <strong>Share tab audio</strong> enabled.</span>
+      <div class="probes-empty-actions">
+        <button id="btnAddProbeInline" class="btn-primary">+ Add FFT Probe</button>
+      </div>
+    </div>
+
+    <div id="probesStack" class="probes-stack"></div>
+  </div>
+
+  <div class="statusbar">
+    <span id="dashStatusLeft">Ready | Audible: 0 | MSE: 0 | FFT Probes: 0</span>
+    <span id="dashStatusRight">FFT 8192-pt | Spek Thermal Scale (-105dB to -15dB)</span>
+  </div>
+
+  <script src="bitrate_chart.js"></script>
+  <script src="dashboard.js"></script>
+</body>
+</html>
