@@ -586,6 +586,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           type: "OFFSCREEN_START",
           tabId: message.tabId,
           streamId: message.streamId,
+          fftSize: message.fftSize || 4096,
         });
         sendResponse(resp || { ok: true });
       } catch (err) {
@@ -609,6 +610,26 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       .sendMessage({ target: "offscreen", type: "OFFSCREEN_RESET" })
       .catch(() => {});
     sendResponse({ ok: true });
+    return true;
+  }
+
+  if (message.type === "SET_FFT_SIZE") {
+    (async () => {
+      if (!(await hasOffscreenDocument())) {
+        sendResponse({ ok: true, fftSize: message.fftSize || 4096 });
+        return;
+      }
+      try {
+        const resp = await chrome.runtime.sendMessage({
+          target: "offscreen",
+          type: "OFFSCREEN_SET_FFT_SIZE",
+          fftSize: message.fftSize || 4096,
+        });
+        sendResponse(resp || { ok: true });
+      } catch {
+        sendResponse({ ok: false });
+      }
+    })();
     return true;
   }
 
@@ -641,6 +662,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           tabId: message.tabId,
           url: message.url,
           nativeSampleRate: message.nativeSampleRate || 0,
+          fftSize: message.fftSize || 4096,
         });
         sendResponse(resp || { ok: false, error: "Empty response from scanner" });
       } catch (err) {

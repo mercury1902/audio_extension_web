@@ -442,8 +442,16 @@
     <!-- Layer 2B: Spek / foobar2000-style Waterfall Spectrogram -->
     <div class="pane">
       <div class="pane-tabbar">
-        <span class="pane-tab" id="wfPaneTitle">Waterfall Spectrogram (Spek)</span>
+        <span class="pane-tab" id="wfPaneTitle">Spectrogram (Spek)</span>
         <div class="fft-controls">
+          <select id="wfFftSelect" class="win-select" title="FFT window size (frequency vs. time resolution)">
+            <option value="512">512</option>
+            <option value="1024">1024</option>
+            <option value="2048">2048</option>
+            <option value="4096" selected>4096</option>
+            <option value="8192">8192</option>
+            <option value="16384">16384</option>
+          </select>
           <select id="wfPaletteSelect" class="win-select" title="Waterfall color palette">
             <option value="inferno" selected>Inferno</option>
             <option value="foobar">Foobar</option>

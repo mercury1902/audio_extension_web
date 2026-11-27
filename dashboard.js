@@ -12,8 +12,14 @@ let rafId = null;
 let lastRenderTs = 0;
 let analysisTimer = null;
 
-const FFT_SIZE = 8192;
+const DEFAULT_FFT_SIZE = 4096;
+const VALID_FFT_SIZES = new Set([512, 1024, 2048, 4096, 8192, 16384]);
 const TIME_FFT_SIZE = 2048;
+
+function sanitizeFftSize(val) {
+  const n = Number(val);
+  return VALID_FFT_SIZES.has(n) ? n : DEFAULT_FFT_SIZE;
+}
 const ANALYSIS_MS = 120;
 const DISPLAY_BINS = 112;
 
@@ -292,12 +298,12 @@ function computeGatedIntegratedLufs(blocks) {
   return -0.691 + 10 * Math.log10(sumRel / countRel);
 }
 
-function detectCutoffHz(holdArr, sr) {
-  const binHz = sr / FFT_SIZE;
+function detectCutoffHz(holdArr, sr, fftSz = DEFAULT_FFT_SIZE) {
+  const binHz = sr / fftSz;
   const nyquist = sr / 2;
 
-  const midStart = Math.floor(2000 / binHz);
-  const midEnd = Math.min(holdArr.length - 1, Math.floor(8000 / binHz));
+  const midStart = Math.min(holdArr.length - 1, Math.floor(2000 / binHz));
+  const midEnd = Math.min(holdArr.length - 1, Math.max(midStart, Math.floor(8000 / binHz)));
   const midVals = [];
   for (let i = midStart; i <= midEnd; i++) {
     midVals.push(holdArr[i]);
@@ -310,8 +316,8 @@ function detectCutoffHz(holdArr, sr) {
   let noiseFloorDb = -104;
   const nfLow = Math.max(nyquist - 1500, 22500);
   if (nyquist >= 23500 && nfLow < nyquist - 50) {
-    const nfStart = Math.floor(nfLow / binHz);
-    const nfEnd = Math.min(holdArr.length - 1, Math.floor((nyquist - 40) / binHz));
+    const nfStart = Math.min(holdArr.length - 1, Math.floor(nfLow / binHz));
+    const nfEnd = Math.min(holdArr.length - 1, Math.max(nfStart, Math.floor((nyquist - 40) / binHz)));
     const nfVals = [];
     for (let i = nfStart; i <= nfEnd; i++) {
       nfVals.push(holdArr[i]);
@@ -324,12 +330,12 @@ function detectCutoffHz(holdArr, sr) {
   const floorThreshold = noiseFloorDb + 5.0;
   const threshold = Math.max(refDb - 64, floorThreshold);
 
-  const stepHz = nyquist > 30000 ? 400 : 150;
+  const stepHz = Math.max(nyquist > 30000 ? 400 : 150, Math.ceil(binHz));
   const bands = [];
 
   for (let f = 8000; f <= nyquist - stepHz; f += stepHz) {
-    const bStart = Math.floor(f / binHz);
-    const bEnd = Math.min(holdArr.length - 1, Math.floor((f + stepHz) / binHz));
+    const bStart = Math.min(holdArr.length - 1, Math.floor(f / binHz));
+    const bEnd = Math.min(holdArr.length - 1, Math.max(bStart, Math.floor((f + stepHz) / binHz)));
     const slice = [];
     for (let i = bStart; i <= bEnd; i++) {
       slice.push(holdArr[i]);
@@ -368,10 +374,10 @@ function downsampleToArray(srcArr, outCount, reuseArr) {
   return out;
 }
 
-function computeLog31ToArray(srcArr, sr, reuseArr) {
+function computeLog31ToArray(srcArr, sr, fftSz, reuseArr) {
   const n = ISO_31_BANDS.length;
   const out = reuseArr && reuseArr.length === n ? reuseArr : new Float32Array(n);
-  const binHz = sr / FFT_SIZE;
+  const binHz = sr / fftSz;
   const maxIdx = srcArr.length - 1;
   const halfStep = Math.pow(2, 1 / 6);
 
@@ -401,8 +407,10 @@ function updateBottomStatusBar() {
   const srText = sharedAudioCtx ? `${sharedAudioCtx.sampleRate} Hz` : "48000 Hz";
   document.getElementById("dashStatusLeft").textContent =
     `Audible: ${audibleCount} | Streams: ${trackedTabs.length} | FFT Probes: ${probes.size} | Peak: ${topBitrate ? `${topBitrate} kbps` : "—"}`;
+  const firstProbe = probes.values().next().value;
+  const fftLabel = firstProbe ? `${firstProbe.fftSize}-pt` : `${DEFAULT_FFT_SIZE}-pt`;
   document.getElementById("dashStatusRight").textContent =
-    `FFT ${FFT_SIZE}-pt | ${srText} | BS.1770-4 LUFS | Stereo Phase | Spek Waterfall`;
+    `FFT ${fftLabel} | ${srText} | BS.1770-4 LUFS | Stereo Phase | Spek Waterfall`;
 }
 
 // ---------- SpectralProbe ----------
@@ -425,6 +433,7 @@ class SpectralProbe {
     this.analyserR = options.analyserR || null;
     this.kAnalyserL = options.kAnalyserL || null;
     this.kAnalyserR = options.kAnalyserR || null;
+    this.fftSize = sanitizeFftSize(options.fftSize || DEFAULT_FFT_SIZE);
     this.sampleRate = options.sampleRate || 48000;
 
     if (this.analyser) {
@@ -559,6 +568,14 @@ class SpectralProbe {
             <div class="chart-pane-head">
               <span class="js-wf-title">Waterfall Spectrogram (Spek)</span>
               <div class="pane-head-tools">
+                <select class="win-select js-wf-fft" title="FFT window size (frequency vs. time resolution)">
+                  <option value="512">512</option>
+                  <option value="1024">1024</option>
+                  <option value="2048">2048</option>
+                  <option value="4096" selected>4096</option>
+                  <option value="8192">8192</option>
+                  <option value="16384">16384</option>
+                </select>
                 <select class="win-select js-wf-palette" title="Waterfall color palette">
                   <option value="inferno" selected>Inferno</option>
                   <option value="foobar">Foobar</option>
@@ -605,6 +622,14 @@ class SpectralProbe {
     this.bitrateRefEl = el.querySelector(".js-bitrate-ref");
     this.srEl = el.querySelector(".js-sr");
     this.verdictEl = el.querySelector(".js-verdict");
+
+    this.wfFftSelect = el.querySelector(".js-wf-fft");
+    if (this.wfFftSelect) {
+      this.wfFftSelect.value = String(this.fftSize);
+      this.wfFftSelect.addEventListener("change", (e) => {
+        this.setFftSize(Number(e.target.value));
+      });
+    }
 
     this.btnLin.addEventListener("click", () => this.setSpectrumScale("lin"));
     this.btnLog.addEventListener("click", () => this.setSpectrumScale("log"));
@@ -678,9 +703,45 @@ class SpectralProbe {
     });
   }
 
+  setFftSize(newSize) {
+    const valid = sanitizeFftSize(newSize);
+    this.fftSize = valid;
+    if (this.wfFftSelect) this.wfFftSelect.value = String(valid);
+
+    if (this.isRemote) {
+      this.smoothMax = null;
+      this.smoothCutoffHz = null;
+      chrome.runtime.sendMessage({
+        target: "background",
+        type: "SET_FFT_SIZE",
+        fftSize: valid,
+      });
+      updateBottomStatusBar();
+      return;
+    }
+
+    if (this.isFullScan && this.linkedTabId != null) {
+      runFullTrackScanForTab(this.linkedTabId, null, valid);
+      return;
+    }
+
+    if (this.analyser) {
+      this.analyser.fftSize = valid;
+      const bins = this.analyser.frequencyBinCount;
+      this.freqData = new Float32Array(bins);
+      this.maxHold = new Float32Array(bins).fill(-140);
+      this.wfPendingBins = null;
+      this.resetMaxHoldOnly();
+      this.updateTextUi();
+    }
+    updateBottomStatusBar();
+  }
+
   applyFullScanData(resp) {
     this.isFullScan = true;
     this.fullScanData = resp;
+    this.fftSize = sanitizeFftSize(resp.fftSize || this.fftSize);
+    if (this.wfFftSelect) this.wfFftSelect.value = String(this.fftSize);
     this.sampleRate = resp.sampleRate || 48000;
     this.cutoffHz = resp.cutoffHz ?? null;
     this.smoothCutoffHz = resp.cutoffHz ?? null;
@@ -997,6 +1058,11 @@ class SpectralProbe {
     this.lastRemoteActiveSec = payload.activeSeconds || 0;
     this.remoteTarget = payload;
     this.lastRemoteTs = performance.now();
+    if (payload.fftSize && payload.fftSize !== this.fftSize) {
+      this.fftSize = sanitizeFftSize(payload.fftSize);
+      if (this.wfFftSelect) this.wfFftSelect.value = String(this.fftSize);
+      updateBottomStatusBar();
+    }
     this.sampleRate = payload.sampleRate || 48000;
     this.activeSeconds = payload.activeSeconds || 0;
     this.cutoffHz = payload.cutoffHz ?? null;
@@ -1125,9 +1191,9 @@ class SpectralProbe {
       this._accumulateWaterfallBins(this.freqData);
     }
 
-    const binHz = this.sampleRate / FFT_SIZE;
-    const midStart = Math.floor(300 / binHz);
-    const midEnd = Math.min(this.freqData.length - 1, Math.floor(5000 / binHz));
+    const binHz = this.sampleRate / this.fftSize;
+    const midStart = Math.min(this.freqData.length - 1, Math.floor(300 / binHz));
+    const midEnd = Math.min(this.freqData.length - 1, Math.max(midStart, Math.floor(5000 / binHz)));
 
     let frameMidPeak = -160;
     for (let i = midStart; i <= midEnd; i++) {
@@ -1145,7 +1211,7 @@ class SpectralProbe {
     }
 
     this.activeSeconds = Number(((this.activeFrames * ANALYSIS_MS) / 1000).toFixed(1));
-    const { cutoffHz, isBrickwall } = detectCutoffHz(this.maxHold, this.sampleRate);
+    const { cutoffHz, isBrickwall } = detectCutoffHz(this.maxHold, this.sampleRate, this.fftSize);
     this.cutoffHz = cutoffHz;
     this.isBrickwall = isBrickwall;
     this.drmSilentWarning =
@@ -1158,7 +1224,7 @@ class SpectralProbe {
 
   stepSmoothing(targetLive, targetMax, dt) {
     const n = targetLive.length;
-    if (!this.smoothLive || this.smoothLive.length !== n) {
+    if (!this.smoothLive || !this.smoothMax || !this.peakCaps || this.smoothLive.length !== n || this.smoothMax.length !== n) {
       this.smoothLive = Float32Array.from(targetLive);
       this.smoothMax = Float32Array.from(targetMax);
       this.peakCaps = Float32Array.from(targetLive);
@@ -1214,8 +1280,8 @@ class SpectralProbe {
       }
 
       if (this.spectrumScale === "log") {
-        computeLog31ToArray(this.freqData, this.sampleRate, this.scratchLogLive);
-        computeLog31ToArray(this.maxHold, this.sampleRate, this.scratchLogMax);
+        computeLog31ToArray(this.freqData, this.sampleRate, this.fftSize, this.scratchLogLive);
+        computeLog31ToArray(this.maxHold, this.sampleRate, this.fftSize, this.scratchLogMax);
         this.stepSmoothing(this.scratchLogLive, this.scratchLogMax, dt);
       } else {
         downsampleToArray(this.freqData, DISPLAY_BINS, this.scratchLiveBins);
@@ -2011,7 +2077,7 @@ async function addTabForFft(preLinkTabId = null) {
 
     const sourceNode = sharedAudioCtx.createMediaStreamSource(stream);
     const analyser = sharedAudioCtx.createAnalyser();
-    analyser.fftSize = FFT_SIZE;
+    analyser.fftSize = DEFAULT_FFT_SIZE;
     analyser.smoothingTimeConstant = 0.0;
     sourceNode.connect(analyser);
 
@@ -2076,6 +2142,7 @@ async function addTabForFft(preLinkTabId = null) {
       analyserR,
       kAnalyserL,
       kAnalyserR,
+      fftSize: DEFAULT_FFT_SIZE,
       sampleRate: sharedAudioCtx.sampleRate,
     });
 
@@ -2100,7 +2167,7 @@ async function addTabForFft(preLinkTabId = null) {
   }
 }
 
-async function runFullTrackScanForTab(tabId, btnEl) {
+async function runFullTrackScanForTab(tabId, btnEl, requestedFftSize = DEFAULT_FFT_SIZE) {
   const tab = cachedTabs.find((t) => t.tabId === tabId);
   if (!tab) return;
   const fileUrl =
@@ -2123,6 +2190,7 @@ async function runFullTrackScanForTab(tabId, btnEl) {
       tabId,
       url: fileUrl,
       nativeSampleRate: tab.telemetry?.nativeSampleRate || 0,
+      fftSize: sanitizeFftSize(requestedFftSize),
     });
 
     if (!resp?.ok) {
@@ -2137,6 +2205,7 @@ async function runFullTrackScanForTab(tabId, btnEl) {
         isFullScan: true,
         linkedTabId: tabId,
         rawLabel: tab.title,
+        fftSize: resp.fftSize || requestedFftSize,
         sampleRate: resp.sampleRate || 48000,
         fullScanData: resp,
       });
@@ -2469,6 +2538,7 @@ chrome.runtime.onMessage.addListener((message) => {
         id: "remote_popup",
         isRemote: true,
         linkedTabId: payload.tabId ?? null,
+        fftSize: payload.fftSize || DEFAULT_FFT_SIZE,
         sampleRate: payload.sampleRate || 48000,
       });
       probes.set("remote_popup", remoteProbe);

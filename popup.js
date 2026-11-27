@@ -75,6 +75,7 @@ const wfColRaw = new Float32Array(WF_HEIGHT);
 let wfPendingBins = null;
 let wfAccumSec = 0;
 let wfHasData = false;
+let wfFftSize = 4096;
 let wfPaletteName = "inferno";
 let wfMinDb = -105;
 let wfHover = { active: false, normX: 0, normY: 0 };
@@ -409,9 +410,9 @@ function updateStatusBar() {
   }
 
   if (fullScanResult) {
-    parts.push(`FULL SCAN (${fullScanResult.scanMs}ms)`);
+    parts.push(`FULL SCAN ${wfFftSize}-pt (${fullScanResult.scanMs}ms)`);
   } else {
-    parts.push(isCapturingCurrentTab ? "FFT + SPEK ON" : "FFT OFF");
+    parts.push(isCapturingCurrentTab ? `FFT ${wfFftSize}-pt` : "FFT OFF");
   }
   summaryEl.textContent = parts.join(" | ");
 }
@@ -1171,7 +1172,7 @@ function renderLoop(now) {
 
   if (tLive && tMax) {
     const n = tLive.length;
-    if (!smoothLive || smoothLive.length !== n) {
+    if (!smoothLive || !smoothMax || !peakCaps || smoothLive.length !== n || smoothMax.length !== n) {
       smoothLive = Float32Array.from(tLive);
       smoothMax = Float32Array.from(tMax);
       peakCaps = Float32Array.from(tLive);
@@ -1319,6 +1320,11 @@ function ingestFftFrame(fft, isInitialState = false) {
     }
   }
 
+  if (fft.fftSize && fft.fftSize !== wfFftSize) {
+    wfFftSize = fft.fftSize;
+    const fftSel = document.getElementById("wfFftSelect");
+    if (fftSel) fftSel.value = String(wfFftSize);
+  }
   latestSampleRate = fft.sampleRate || 48000;
   updateButtons(true);
   targetFft = fft;
@@ -1374,26 +1380,7 @@ wfViewCanvas.addEventListener("mouseleave", () => {
   }
 });
 
-document.getElementById("wfPaletteSelect").addEventListener("change", (e) => {
-  wfPaletteName = e.target.value;
-  repaintWaterfallFromDbBuffer();
-  redrawWaterfallIdleIfNeeded();
-});
-
-document.getElementById("wfFloorSelect").addEventListener("change", (e) => {
-  wfMinDb = Number(e.target.value) || -105;
-  repaintWaterfallFromDbBuffer();
-  redrawWaterfallIdleIfNeeded();
-});
-
-document.getElementById("btnScaleLin").addEventListener("click", () => setSpectrumScale("lin"));
-document.getElementById("btnScaleLog").addEventListener("click", () => setSpectrumScale("log"));
-
-document.getElementById("btnOpenDashboard").addEventListener("click", () => {
-  chrome.runtime.sendMessage({ target: "background", type: "OPEN_DASHBOARD" });
-});
-
-document.getElementById("btnScanFull").addEventListener("click", async () => {
+async function runFullTrackScan() {
   const fileUrl = getLocalFileUrl();
   if (!fileUrl || isScanningFull) return;
 
@@ -1403,7 +1390,7 @@ document.getElementById("btnScanFull").addEventListener("click", async () => {
   btn.disabled = true;
   btn.textContent = "Scanning...";
   verdictBox.className = "verdict";
-  verdictBox.textContent = "Decoding full track offline (FFT + BS.1770-4 LUFS)...";
+  verdictBox.textContent = `Decoding full track offline (FFT ${wfFftSize}-pt + BS.1770-4 LUFS)...`;
 
   try {
     if (isCapturingCurrentTab) {
@@ -1418,6 +1405,7 @@ document.getElementById("btnScanFull").addEventListener("click", async () => {
       tabId: currentTabId,
       url: fileUrl,
       nativeSampleRate: latestLayer1?.nativeSampleRate || 0,
+      fftSize: wfFftSize,
     });
 
     if (!resp?.ok) {
@@ -1425,9 +1413,10 @@ document.getElementById("btnScanFull").addEventListener("click", async () => {
     }
 
     fullScanResult = resp;
+    wfFftSize = resp.fftSize || wfFftSize;
     latestSampleRate = resp.sampleRate || 48000;
     document.getElementById("wfPaneTitle").textContent =
-      `Full-Track Spectrogram (0:00 → ${formatDuration(resp.duration)})`;
+      `Full-Track (0:00 → ${formatDuration(resp.duration)})`;
     document.getElementById("cutoffVal").textContent = resp.cutoffHz
       ? `~${(resp.cutoffHz / 1000).toFixed(1)} kHz`
       : "—";
@@ -1447,7 +1436,46 @@ document.getElementById("btnScanFull").addEventListener("click", async () => {
     btn.disabled = false;
     btn.textContent = "Scan Full";
   }
+}
+
+document.getElementById("wfFftSelect").addEventListener("change", (e) => {
+  wfFftSize = Number(e.target.value) || 4096;
+  if (fullScanResult) {
+    runFullTrackScan();
+    return;
+  }
+  if (isCapturingCurrentTab) {
+    smoothMax = null;
+    smoothCutoffHz = null;
+    chrome.runtime.sendMessage({
+      target: "background",
+      type: "SET_FFT_SIZE",
+      fftSize: wfFftSize,
+    });
+  }
+  updateStatusBar();
 });
+
+document.getElementById("wfPaletteSelect").addEventListener("change", (e) => {
+  wfPaletteName = e.target.value;
+  repaintWaterfallFromDbBuffer();
+  redrawWaterfallIdleIfNeeded();
+});
+
+document.getElementById("wfFloorSelect").addEventListener("change", (e) => {
+  wfMinDb = Number(e.target.value) || -105;
+  repaintWaterfallFromDbBuffer();
+  redrawWaterfallIdleIfNeeded();
+});
+
+document.getElementById("btnScaleLin").addEventListener("click", () => setSpectrumScale("lin"));
+document.getElementById("btnScaleLog").addEventListener("click", () => setSpectrumScale("log"));
+
+document.getElementById("btnOpenDashboard").addEventListener("click", () => {
+  chrome.runtime.sendMessage({ target: "background", type: "OPEN_DASHBOARD" });
+});
+
+document.getElementById("btnScanFull").addEventListener("click", runFullTrackScan);
 
 document.getElementById("btnToggleFft").addEventListener("click", async () => {
   if (!currentTabId) return;
@@ -1470,7 +1498,7 @@ document.getElementById("btnToggleFft").addEventListener("click", async () => {
 
   // Exit full-scan mode and start real-time capture
   fullScanResult = null;
-  document.getElementById("wfPaneTitle").textContent = "Waterfall Spectrogram (Spek)";
+  document.getElementById("wfPaneTitle").textContent = "Spectrogram (Spek)";
 
   try {
     const streamId = await chrome.tabCapture.getMediaStreamId({
@@ -1481,6 +1509,7 @@ document.getElementById("btnToggleFft").addEventListener("click", async () => {
       type: "START_FFT",
       tabId: currentTabId,
       streamId,
+      fftSize: wfFftSize,
     });
 
     if (resp?.ok) {
@@ -1500,7 +1529,7 @@ document.getElementById("btnToggleFft").addEventListener("click", async () => {
 
 document.getElementById("btnResetFft").addEventListener("click", () => {
   fullScanResult = null;
-  document.getElementById("wfPaneTitle").textContent = "Waterfall Spectrogram (Spek)";
+  document.getElementById("wfPaneTitle").textContent = "Spectrogram (Spek)";
   chrome.runtime.sendMessage({ target: "background", type: "RESET_FFT" });
   resetAnimBuffers();
   clearWaterfall();

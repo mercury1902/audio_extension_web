@@ -33,8 +33,15 @@ let momentaryBlocks = []; // 400ms rolling window of K-weighted (zL + zR)
 let gatedBlocks = [];     // 400ms block powers sampled every ~100ms for Integrated LUFS
 let lufsHopAccumMs = 0;
 
-const FFT_SIZE = 8192;
+const DEFAULT_FFT_SIZE = 4096;
+const VALID_FFT_SIZES = new Set([512, 1024, 2048, 4096, 8192, 16384]);
+let currentFftSize = DEFAULT_FFT_SIZE;
 const TIME_FFT_SIZE = 2048;
+
+function sanitizeFftSize(val) {
+  const n = Number(val);
+  return VALID_FFT_SIZES.has(n) ? n : DEFAULT_FFT_SIZE;
+}
 const INTERVAL_MS = 30;
 const CUTOFF_EVERY_N_TICKS = 4;
 const DISPLAY_BINS = 128;
@@ -104,12 +111,12 @@ function percentile(arr, p) {
   return sorted[idx];
 }
 
-function detectCutoffHz(holdArr, sr) {
-  const binHz = sr / FFT_SIZE;
+function detectCutoffHz(holdArr, sr, fftSz = currentFftSize) {
+  const binHz = sr / fftSz;
   const nyquist = sr / 2;
 
-  const midStart = Math.floor(2000 / binHz);
-  const midEnd = Math.min(holdArr.length - 1, Math.floor(8000 / binHz));
+  const midStart = Math.min(holdArr.length - 1, Math.floor(2000 / binHz));
+  const midEnd = Math.min(holdArr.length - 1, Math.max(midStart, Math.floor(8000 / binHz)));
   const midVals = [];
   for (let i = midStart; i <= midEnd; i++) {
     midVals.push(holdArr[i]);
@@ -122,8 +129,8 @@ function detectCutoffHz(holdArr, sr) {
   let noiseFloorDb = -104;
   const nfLow = Math.max(nyquist - 1500, 22500);
   if (nyquist >= 23500 && nfLow < nyquist - 50) {
-    const nfStart = Math.floor(nfLow / binHz);
-    const nfEnd = Math.min(holdArr.length - 1, Math.floor((nyquist - 40) / binHz));
+    const nfStart = Math.min(holdArr.length - 1, Math.floor(nfLow / binHz));
+    const nfEnd = Math.min(holdArr.length - 1, Math.max(nfStart, Math.floor((nyquist - 40) / binHz)));
     const nfVals = [];
     for (let i = nfStart; i <= nfEnd; i++) {
       nfVals.push(holdArr[i]);
@@ -136,12 +143,12 @@ function detectCutoffHz(holdArr, sr) {
   const floorThreshold = noiseFloorDb + 5.0;
   const threshold = Math.max(refDb - 64, floorThreshold);
 
-  const stepHz = nyquist > 30000 ? 400 : 150;
+  const stepHz = Math.max(nyquist > 30000 ? 400 : 150, Math.ceil(binHz));
   const bands = [];
 
   for (let f = 8000; f <= nyquist - stepHz; f += stepHz) {
-    const bStart = Math.floor(f / binHz);
-    const bEnd = Math.min(holdArr.length - 1, Math.floor((f + stepHz) / binHz));
+    const bStart = Math.min(holdArr.length - 1, Math.floor(f / binHz));
+    const bEnd = Math.min(holdArr.length - 1, Math.max(bStart, Math.floor((f + stepHz) / binHz)));
     const slice = [];
     for (let i = bStart; i <= bEnd; i++) {
       slice.push(holdArr[i]);
@@ -180,8 +187,8 @@ function downsampleForCanvas(arr, outCount) {
   return out;
 }
 
-function computeLog31Bins(arr, sr) {
-  const binHz = sr / FFT_SIZE;
+function computeLog31Bins(arr, sr, fftSz = currentFftSize) {
+  const binHz = sr / fftSz;
   const maxIdx = arr.length - 1;
   const halfStep = Math.pow(2, 1 / 6);
   const out = new Array(ISO_31_BANDS.length);
@@ -384,9 +391,9 @@ function analyzeTick() {
   }
   totalFrames += 1;
 
-  const binHz = sampleRate / FFT_SIZE;
-  const midStart = Math.floor(300 / binHz);
-  const midEnd = Math.min(freqData.length - 1, Math.floor(5000 / binHz));
+  const binHz = sampleRate / currentFftSize;
+  const midStart = Math.min(freqData.length - 1, Math.floor(300 / binHz));
+  const midEnd = Math.min(freqData.length - 1, Math.max(midStart, Math.floor(5000 / binHz)));
 
   let frameMidPeak = -160;
   for (let i = midStart; i <= midEnd; i++) {
@@ -404,7 +411,7 @@ function analyzeTick() {
   }
 
   if (totalFrames % CUTOFF_EVERY_N_TICKS === 0 || cachedCutoffHz === null) {
-    const res = detectCutoffHz(maxHold, sampleRate);
+    const res = detectCutoffHz(maxHold, sampleRate, currentFftSize);
     cachedCutoffHz = res.cutoffHz;
     cachedRefDb = res.refDb;
     cachedIsBrickwall = res.isBrickwall;
@@ -416,8 +423,8 @@ function analyzeTick() {
 
   const liveBins = downsampleForCanvas(freqData, DISPLAY_BINS);
   const maxBins = downsampleForCanvas(maxHold, DISPLAY_BINS);
-  const logLiveBins = computeLog31Bins(freqData, sampleRate);
-  const logMaxBins = computeLog31Bins(maxHold, sampleRate);
+  const logLiveBins = computeLog31Bins(freqData, sampleRate, currentFftSize);
+  const logMaxBins = computeLog31Bins(maxHold, sampleRate, currentFftSize);
   const dynamics = computeStereoAndLoudness(timeDataL, timeDataR, kTimeDataL, kTimeDataR);
 
   wfHistory.push(quantizeColumnForHistory(liveBins));
@@ -428,6 +435,7 @@ function analyzeTick() {
   latestFrame = {
     capturing: true,
     tabId: capturedTabId,
+    fftSize: currentFftSize,
     sampleRate,
     nyquist: sampleRate / 2,
     activeSeconds,
@@ -451,8 +459,27 @@ function analyzeTick() {
     .catch(() => {});
 }
 
-async function startCapture(tabId, streamId) {
+function setFftSize(newSize) {
+  const valid = sanitizeFftSize(newSize);
+  if (valid === currentFftSize && analyser) return currentFftSize;
+  currentFftSize = valid;
+  if (analyser) {
+    analyser.fftSize = currentFftSize;
+    freqData = new Float32Array(analyser.frequencyBinCount);
+    maxHold = new Float32Array(analyser.frequencyBinCount).fill(-140);
+    totalFrames = 0;
+    activeFrames = 0;
+    overallMaxDb = -160;
+    cachedCutoffHz = null;
+    cachedRefDb = -140;
+    cachedIsBrickwall = false;
+  }
+  return currentFftSize;
+}
+
+async function startCapture(tabId, streamId, requestedFftSize) {
   stopCapture();
+  currentFftSize = sanitizeFftSize(requestedFftSize || currentFftSize);
 
   mediaStream = await navigator.mediaDevices.getUserMedia({
     audio: {
@@ -471,7 +498,7 @@ async function startCapture(tabId, streamId) {
 
   // Main FFT analyser (mono mix)
   analyser = audioCtx.createAnalyser();
-  analyser.fftSize = FFT_SIZE;
+  analyser.fftSize = currentFftSize;
   analyser.smoothingTimeConstant = 0.0;
   source.connect(analyser);
   source.connect(audioCtx.destination);
@@ -535,37 +562,46 @@ async function startCapture(tabId, streamId) {
   analyzeTick();
 }
 
-// ---------- Ultra-Fast Full-Track Offline Scanner (Radix-2 FFT + BS.1770-4 LUFS) ----------
+// ---------- Ultra-Fast Full-Track Offline Scanner (Dynamic Radix-2 FFT + BS.1770-4 LUFS) ----------
 
-const FFT_BIT_REV = new Uint32Array(FFT_SIZE);
-const FFT_HANN = new Float32Array(FFT_SIZE);
-const FFT_COS = new Float32Array(FFT_SIZE >> 1);
-const FFT_SIN = new Float32Array(FFT_SIZE >> 1);
+const fftTableCache = new Map();
 
-(() => {
-  const bits = Math.round(Math.log2(FFT_SIZE));
-  for (let i = 0; i < FFT_SIZE; i++) {
+function getFftTables(n) {
+  let tbl = fftTableCache.get(n);
+  if (tbl) return tbl;
+
+  const bitRev = new Uint32Array(n);
+  const hann = new Float32Array(n);
+  const half = n >> 1;
+  const cos = new Float32Array(half);
+  const sin = new Float32Array(half);
+  const bits = Math.round(Math.log2(n));
+
+  for (let i = 0; i < n; i++) {
     let x = i;
     let y = 0;
     for (let b = 0; b < bits; b++) {
       y = (y << 1) | (x & 1);
       x >>= 1;
     }
-    FFT_BIT_REV[i] = y;
-    FFT_HANN[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (FFT_SIZE - 1)));
+    bitRev[i] = y;
+    hann[i] = 0.5 * (1 - Math.cos((2 * Math.PI * i) / (n - 1)));
   }
-  const half = FFT_SIZE >> 1;
   for (let k = 0; k < half; k++) {
-    const angle = (-2 * Math.PI * k) / FFT_SIZE;
-    FFT_COS[k] = Math.cos(angle);
-    FFT_SIN[k] = Math.sin(angle);
+    const angle = (-2 * Math.PI * k) / n;
+    cos[k] = Math.cos(angle);
+    sin[k] = Math.sin(angle);
   }
-})();
 
-function runRadix2Fft(re, im) {
-  const n = FFT_SIZE;
+  tbl = { bitRev, hann, cos, sin };
+  fftTableCache.set(n, tbl);
+  return tbl;
+}
+
+function runRadix2Fft(re, im, n, tables) {
+  const { bitRev, cos, sin } = tables;
   for (let i = 0; i < n; i++) {
-    const j = FFT_BIT_REV[i];
+    const j = bitRev[i];
     if (j > i) {
       const tr = re[i];
       re[i] = re[j];
@@ -582,8 +618,8 @@ function runRadix2Fft(re, im) {
     for (let i = 0; i < n; i += size) {
       let tableIdx = 0;
       for (let j = i; j < i + half; j++) {
-        const wr = FFT_COS[tableIdx];
-        const wi = FFT_SIN[tableIdx];
+        const wr = cos[tableIdx];
+        const wi = sin[tableIdx];
         tableIdx += step;
 
         const k = j + half;
@@ -659,8 +695,10 @@ async function decodeAtNativeSampleRate(arrayBuffer, nativeSampleRate) {
   }
 }
 
-async function scanFullTrack(tabId, url, nativeSampleRate) {
+async function scanFullTrack(tabId, url, nativeSampleRate, requestedFftSize) {
   const t0 = performance.now();
+  const scanFftSize = sanitizeFftSize(requestedFftSize || currentFftSize);
+  const fftTables = getFftTables(scanFftSize);
   const resp = await fetch(url);
   if (!resp.ok) throw new Error(`HTTP ${resp.status} while reading audio file`);
   const arrayBuffer = await resp.arrayBuffer();
@@ -741,36 +779,37 @@ async function scanFullTrack(tabId, url, nativeSampleRate) {
   }
   const integratedLufs = computeGatedIntegratedLufs(fullGatedBlocks);
 
-  // Pass 2: 420-column Full-Track 8192-pt FFT Spectrogram + Max-Hold + Average Spectrum
+  // Pass 2: 420-column Full-Track FFT Spectrogram + Max-Hold + Average Spectrum
   const NUM_COLS = 420;
-  const binCount = FFT_SIZE >> 1;
+  const binCount = scanFftSize >> 1;
   const fullMaxHold = new Float32Array(binCount).fill(-140);
   const fullAvgAccum = new Float64Array(binCount);
   let activeSlices = 0;
 
-  const re = new Float32Array(FFT_SIZE);
-  const im = new Float32Array(FFT_SIZE);
+  const re = new Float32Array(scanFftSize);
+  const im = new Float32Array(scanFftSize);
   const sliceDb = new Float32Array(binCount);
   const wfCols = new Array(NUM_COLS);
-  const invN = 1 / FFT_SIZE;
+  const invN = 1 / scanFftSize;
+  const hann = fftTables.hann;
 
   for (let c = 0; c < NUM_COLS; c++) {
-    const center = Math.floor(((c + 0.5) / NUM_COLS) * Math.max(1, len - FFT_SIZE));
-    const offset = Math.max(0, Math.min(len - FFT_SIZE, center));
+    const center = Math.floor(((c + 0.5) / NUM_COLS) * Math.max(1, len - scanFftSize));
+    const offset = Math.max(0, Math.min(Math.max(0, len - scanFftSize), center));
 
-    for (let i = 0; i < FFT_SIZE; i++) {
+    for (let i = 0; i < scanFftSize; i++) {
       const idx = offset + i;
       const sample = idx < len ? 0.5 * (chL[idx] + chR[idx]) : 0;
-      re[i] = sample * FFT_HANN[i];
+      re[i] = sample * hann[i];
       im[i] = 0;
     }
 
-    runRadix2Fft(re, im);
+    runRadix2Fft(re, im, scanFftSize, fftTables);
 
     let sliceMidPeak = -160;
-    const binHz = sr / FFT_SIZE;
-    const midStart = Math.floor(300 / binHz);
-    const midEnd = Math.min(binCount - 1, Math.floor(5000 / binHz));
+    const binHz = sr / scanFftSize;
+    const midStart = Math.min(binCount - 1, Math.floor(300 / binHz));
+    const midEnd = Math.min(binCount - 1, Math.max(midStart, Math.floor(5000 / binHz)));
 
     for (let b = 0; b < binCount; b++) {
       const mag = Math.sqrt(re[b] * re[b] + im[b] * im[b]) * invN;
@@ -801,13 +840,14 @@ async function scanFullTrack(tabId, url, nativeSampleRate) {
     fullAvgSpec.fill(-140);
   }
 
-  const cutoffRes = detectCutoffHz(fullMaxHold, sr);
+  const cutoffRes = detectCutoffHz(fullMaxHold, sr, scanFftSize);
   const scanMs = Math.round(performance.now() - t0);
 
   return {
     ok: true,
     fullScan: true,
     tabId,
+    fftSize: scanFftSize,
     sampleRate: sr,
     nyquist: sr / 2,
     duration: Number(duration.toFixed(2)),
@@ -817,8 +857,8 @@ async function scanFullTrack(tabId, url, nativeSampleRate) {
     isBrickwall: cutoffRes.isBrickwall,
     liveBins: downsampleForCanvas(fullAvgSpec, DISPLAY_BINS),
     maxBins: downsampleForCanvas(fullMaxHold, DISPLAY_BINS),
-    logLiveBins: computeLog31Bins(fullAvgSpec, sr),
-    logMaxBins: computeLog31Bins(fullMaxHold, sr),
+    logLiveBins: computeLog31Bins(fullAvgSpec, sr, scanFftSize),
+    logMaxBins: computeLog31Bins(fullMaxHold, sr, scanFftSize),
     wfCols,
     peakDbfs: Math.round(peakDbfs * 10) / 10,
     rmsDbfs: Math.round(rmsDbfs * 10) / 10,
@@ -838,8 +878,8 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (message.target !== "offscreen") return;
 
   if (message.type === "OFFSCREEN_START") {
-    startCapture(message.tabId, message.streamId)
-      .then(() => sendResponse({ ok: true, sampleRate }))
+    startCapture(message.tabId, message.streamId, message.fftSize)
+      .then(() => sendResponse({ ok: true, sampleRate, fftSize: currentFftSize }))
       .catch((err) => {
         stopCapture();
         sendResponse({ ok: false, error: err?.message || String(err) });
@@ -859,6 +899,12 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     return;
   }
 
+  if (message.type === "OFFSCREEN_SET_FFT_SIZE") {
+    const applied = setFftSize(message.fftSize);
+    sendResponse({ ok: true, fftSize: applied });
+    return;
+  }
+
   if (message.type === "OFFSCREEN_GET_STATE") {
     sendResponse(
       latestFrame
@@ -866,6 +912,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         : {
             capturing: Boolean(mediaStream),
             tabId: capturedTabId,
+            fftSize: currentFftSize,
             sampleRate,
             nyquist: sampleRate / 2,
             activeSeconds: 0,
@@ -878,7 +925,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   }
 
   if (message.type === "OFFSCREEN_SCAN_FULL") {
-    scanFullTrack(message.tabId, message.url, message.nativeSampleRate || 0)
+    scanFullTrack(message.tabId, message.url, message.nativeSampleRate || 0, message.fftSize)
       .then((res) => sendResponse(res))
       .catch((err) =>
         sendResponse({ ok: false, error: err?.message || String(err) })
