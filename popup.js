@@ -49,10 +49,12 @@ const LOG_31_LABELS = [
   "12k", "16k", "20k",
 ];
 
-// Waterfall Spectrogram offscreen buffer + raw dB matrix for instant repaint & hover readout
+// Waterfall Spectrogram offscreen buffer + perceptual contrast curve (foobar2000-style density)
 const WF_WIDTH = 420;
 const WF_HEIGHT = 152;
-const WF_COLS_PER_SEC = 32; // ~13.1s total time span across plot width
+const WF_COLS_PER_SEC = 32;
+const WF_MAX_DB = -24; // Per-bin 8192-pt FFT peak ceiling for bold mid/high contrast
+const WF_GAMMA = 0.72; // Perceptual curve boosting mid-level harmonics without lifting floor
 
 const wfCanvas = document.createElement("canvas");
 wfCanvas.width = WF_WIDTH;
@@ -61,7 +63,9 @@ const wfCtx = wfCanvas.getContext("2d");
 const wfColImg = wfCtx.createImageData(1, WF_HEIGHT);
 const wfFullImg = wfCtx.createImageData(WF_WIDTH, WF_HEIGHT);
 const wfDbBuffer = new Float32Array(WF_WIDTH * WF_HEIGHT).fill(-140);
+const wfColRaw = new Float32Array(WF_HEIGHT);
 
+let wfPendingBins = null;
 let wfAccumSec = 0;
 let wfHasData = false;
 let wfPaletteName = "inferno";
@@ -93,78 +97,103 @@ const WF_PALETTES = {
   inferno: {
     lut: buildPaletteLut([
       { t: 0.0, r: 24, g: 24, b: 24 },
-      { t: 0.16, r: 34, g: 22, b: 72 },
-      { t: 0.36, r: 106, g: 27, b: 132 },
-      { t: 0.56, r: 196, g: 46, b: 90 },
-      { t: 0.74, r: 244, g: 120, b: 36 },
-      { t: 0.9, r: 253, g: 208, b: 64 },
-      { t: 1.0, r: 255, g: 252, b: 234 },
+      { t: 0.14, r: 44, g: 24, b: 92 },
+      { t: 0.32, r: 126, g: 30, b: 142 },
+      { t: 0.52, r: 212, g: 54, b: 86 },
+      { t: 0.72, r: 248, g: 132, b: 36 },
+      { t: 0.88, r: 254, g: 214, b: 68 },
+      { t: 1.0, r: 255, g: 253, b: 238 },
     ]),
     legend: [
-      [0.0, "rgb(255,252,234)"],
-      [0.12, "rgb(253,208,64)"],
-      [0.28, "rgb(244,120,36)"],
-      [0.46, "rgb(196,46,90)"],
-      [0.66, "rgb(106,27,132)"],
-      [0.84, "rgb(34,22,72)"],
+      [0.0, "rgb(255,253,238)"],
+      [0.12, "rgb(254,214,68)"],
+      [0.28, "rgb(248,132,36)"],
+      [0.48, "rgb(212,54,86)"],
+      [0.68, "rgb(126,30,142)"],
+      [0.86, "rgb(44,24,92)"],
+      [1.0, "rgb(24,24,24)"],
+    ],
+  },
+  foobar: {
+    lut: buildPaletteLut([
+      { t: 0.0, r: 24, g: 24, b: 24 },
+      { t: 0.16, r: 22, g: 48, b: 102 },
+      { t: 0.38, r: 34, g: 106, b: 184 },
+      { t: 0.62, r: 66, g: 178, b: 232 },
+      { t: 0.84, r: 168, g: 226, b: 252 },
+      { t: 1.0, r: 255, g: 255, b: 255 },
+    ]),
+    legend: [
+      [0.0, "rgb(255,255,255)"],
+      [0.16, "rgb(168,226,252)"],
+      [0.38, "rgb(66,178,232)"],
+      [0.62, "rgb(34,106,184)"],
+      [0.84, "rgb(22,48,102)"],
       [1.0, "rgb(24,24,24)"],
     ],
   },
   spek: {
     lut: buildPaletteLut([
       { t: 0.0, r: 24, g: 24, b: 24 },
-      { t: 0.15, r: 18, g: 34, b: 112 },
-      { t: 0.34, r: 18, g: 134, b: 186 },
-      { t: 0.52, r: 34, g: 180, b: 96 },
-      { t: 0.7, r: 230, g: 206, b: 38 },
-      { t: 0.86, r: 228, g: 62, b: 34 },
+      { t: 0.14, r: 22, g: 42, b: 128 },
+      { t: 0.32, r: 20, g: 148, b: 198 },
+      { t: 0.5, r: 38, g: 192, b: 102 },
+      { t: 0.68, r: 238, g: 212, b: 42 },
+      { t: 0.85, r: 236, g: 68, b: 36 },
       { t: 1.0, r: 255, g: 255, b: 255 },
     ]),
     legend: [
       [0.0, "rgb(255,255,255)"],
-      [0.14, "rgb(228,62,34)"],
-      [0.3, "rgb(230,206,38)"],
-      [0.48, "rgb(34,180,96)"],
-      [0.66, "rgb(18,134,186)"],
-      [0.85, "rgb(18,34,112)"],
+      [0.15, "rgb(236,68,36)"],
+      [0.32, "rgb(238,212,42)"],
+      [0.5, "rgb(38,192,102)"],
+      [0.68, "rgb(20,148,198)"],
+      [0.86, "rgb(22,42,128)"],
       [1.0, "rgb(24,24,24)"],
     ],
   },
   viridis: {
     lut: buildPaletteLut([
       { t: 0.0, r: 24, g: 24, b: 24 },
-      { t: 0.18, r: 59, g: 42, b: 108 },
-      { t: 0.38, r: 44, g: 113, b: 142 },
-      { t: 0.58, r: 33, g: 165, b: 133 },
-      { t: 0.78, r: 122, g: 209, b: 81 },
-      { t: 1.0, r: 253, g: 231, b: 37 },
+      { t: 0.18, r: 62, g: 46, b: 118 },
+      { t: 0.38, r: 46, g: 120, b: 148 },
+      { t: 0.58, r: 36, g: 174, b: 138 },
+      { t: 0.78, r: 132, g: 216, b: 84 },
+      { t: 1.0, r: 254, g: 234, b: 42 },
     ]),
     legend: [
-      [0.0, "rgb(253,231,37)"],
-      [0.22, "rgb(122,209,81)"],
-      [0.42, "rgb(33,165,133)"],
-      [0.62, "rgb(44,113,142)"],
-      [0.82, "rgb(59,42,108)"],
+      [0.0, "rgb(254,234,42)"],
+      [0.22, "rgb(132,216,84)"],
+      [0.42, "rgb(36,174,138)"],
+      [0.62, "rgb(46,120,148)"],
+      [0.82, "rgb(62,46,118)"],
       [1.0, "rgb(24,24,24)"],
     ],
   },
   mono: {
     lut: buildPaletteLut([
       { t: 0.0, r: 24, g: 24, b: 24 },
-      { t: 0.28, r: 58, g: 70, b: 84 },
-      { t: 0.56, r: 108, g: 128, b: 148 },
-      { t: 0.82, r: 176, g: 196, b: 216 },
-      { t: 1.0, r: 244, g: 250, b: 255 },
+      { t: 0.26, r: 66, g: 80, b: 96 },
+      { t: 0.54, r: 120, g: 142, b: 164 },
+      { t: 0.8, r: 188, g: 208, b: 228 },
+      { t: 1.0, r: 250, g: 253, b: 255 },
     ]),
     legend: [
-      [0.0, "rgb(244,250,255)"],
-      [0.25, "rgb(176,196,216)"],
-      [0.5, "rgb(108,128,148)"],
-      [0.75, "rgb(58,70,84)"],
+      [0.0, "rgb(250,253,255)"],
+      [0.2, "rgb(188,208,228)"],
+      [0.46, "rgb(120,142,164)"],
+      [0.74, "rgb(66,80,96)"],
       [1.0, "rgb(24,24,24)"],
     ],
   },
 };
+
+function mapDbToLutIndex(db, floorDb) {
+  const span = WF_MAX_DB - floorDb;
+  const linear = Math.max(0, Math.min(1, (db - floorDb) / span));
+  if (linear <= 0) return 0;
+  return Math.round(Math.pow(linear, WF_GAMMA) * 255);
+}
 
 function syncCanvasDpr(canvasEl, context, fallbackW, fallbackH) {
   const dpr = window.devicePixelRatio || 1;
@@ -182,6 +211,7 @@ function syncCanvasDpr(canvasEl, context, fallbackW, fallbackH) {
 
 function clearWaterfall() {
   wfDbBuffer.fill(-140);
+  wfPendingBins = null;
   wfCtx.fillStyle = "#181818";
   wfCtx.fillRect(0, 0, WF_WIDTH, WF_HEIGHT);
   wfAccumSec = 0;
@@ -197,14 +227,12 @@ function repaintWaterfallFromDbBuffer() {
 
   const lut = (WF_PALETTES[wfPaletteName] || WF_PALETTES.inferno).lut;
   const data = wfFullImg.data;
-  const dbSpan = MAX_DB - wfMinDb;
 
   for (let col = 0; col < WF_WIDTH; col++) {
     const colOffset = col * WF_HEIGHT;
     for (let y = 0; y < WF_HEIGHT; y++) {
       const db = wfDbBuffer[colOffset + y];
-      const norm = Math.max(0, Math.min(1, (db - wfMinDb) / dbSpan));
-      const idx = Math.round(norm * 255) * 3;
+      const idx = mapDbToLutIndex(db, wfMinDb) * 3;
       const p = (y * WF_WIDTH + col) * 4;
       data[p] = lut[idx];
       data[p + 1] = lut[idx + 1];
@@ -221,11 +249,7 @@ function pushWaterfallColumn(freqArr, isQuantizedByte = false) {
   const srcLen = freqArr.length;
   const data = wfColImg.data;
   const lut = (WF_PALETTES[wfPaletteName] || WF_PALETTES.inferno).lut;
-  const dbSpan = MAX_DB - wfMinDb;
   const histSpan = MAX_DB - MIN_DB;
-
-  wfDbBuffer.copyWithin(0, WF_HEIGHT);
-  const newestColOffset = (WF_WIDTH - 1) * WF_HEIGHT;
 
   for (let y = 0; y < WF_HEIGHT; y++) {
     const freqTop = 1 - y / WF_HEIGHT;
@@ -245,11 +269,21 @@ function pushWaterfallColumn(freqArr, isQuantizedByte = false) {
         if (freqArr[b] > maxDb) maxDb = freqArr[b];
       }
     }
+    wfColRaw[y] = maxDb;
+  }
 
-    wfDbBuffer[newestColOffset + y] = maxDb;
+  wfDbBuffer.copyWithin(0, WF_HEIGHT);
+  const newestColOffset = (WF_WIDTH - 1) * WF_HEIGHT;
 
-    const norm = Math.max(0, Math.min(1, (maxDb - wfMinDb) / dbSpan));
-    const idx = Math.round(norm * 255) * 3;
+  // Subtle 1px vertical harmonic thickening (foobar2000-style rich body)
+  for (let y = 0; y < WF_HEIGHT; y++) {
+    let db = wfColRaw[y];
+    if (y > 0 && wfColRaw[y - 1] - 3.5 > db) db = wfColRaw[y - 1] - 3.5;
+    if (y < WF_HEIGHT - 1 && wfColRaw[y + 1] - 3.5 > db) db = wfColRaw[y + 1] - 3.5;
+
+    wfDbBuffer[newestColOffset + y] = db;
+
+    const idx = mapDbToLutIndex(db, wfMinDb) * 3;
     const p = y * 4;
     data[p] = lut[idx];
     data[p + 1] = lut[idx + 1];
@@ -786,12 +820,12 @@ function drawWaterfallFrame(nyquist, cutoffHz) {
   wfViewCtx.strokeStyle = "#363636";
   wfViewCtx.strokeRect(legendX + 0.5, padTop + 0.5, legendW - 1, plotH - 1);
 
-  const midDb = Math.round((MAX_DB + wfMinDb) / 2);
+  const midDb = Math.round((WF_MAX_DB + wfMinDb) / 2);
   wfViewCtx.fillStyle = "#7a7a7a";
   wfViewCtx.font = "9px Segoe UI, Tahoma, sans-serif";
   wfViewCtx.textAlign = "left";
   wfViewCtx.textBaseline = "middle";
-  wfViewCtx.fillText(`${MAX_DB}`, legendX + legendW + 3, padTop + 4);
+  wfViewCtx.fillText(`${WF_MAX_DB}`, legendX + legendW + 3, padTop + 4);
   wfViewCtx.fillText(`${midDb}`, legendX + legendW + 3, padTop + plotH / 2);
   wfViewCtx.fillText(`${wfMinDb}`, legendX + legendW + 3, padTop + plotH - 4);
 
@@ -878,19 +912,22 @@ function renderLoop(now) {
   const dt = lastRenderTs ? Math.min((now - lastRenderTs) / 1000, 0.1) : 1 / 60;
   lastRenderTs = now;
 
-  const rawLinLive = targetFft.liveBins;
+  const colSource = wfPendingBins || targetFft.liveBins;
   const nyquist = targetFft.nyquist || 24000;
 
-  if (rawLinLive) {
+  if (colSource) {
     const wfStepSec = 1 / WF_COLS_PER_SEC;
     wfAccumSec += dt;
     let steps = 0;
     while (wfAccumSec >= wfStepSec && steps < 3) {
-      pushWaterfallColumn(rawLinLive, false);
+      pushWaterfallColumn(colSource, false);
       wfAccumSec -= wfStepSec;
       steps += 1;
     }
-    if (steps === 3) wfAccumSec = 0;
+    if (steps > 0) {
+      wfPendingBins = null;
+      if (steps === 3) wfAccumSec = 0;
+    }
   }
 
   const tLive =
@@ -975,6 +1012,7 @@ function stopRenderLoop() {
     rafId = null;
   }
   targetFft = null;
+  wfPendingBins = null;
   lastActiveSeconds = 0;
   resetAnimBuffers();
 }
@@ -998,6 +1036,19 @@ function ingestFftFrame(fft, isInitialState = false) {
     clearWaterfall();
   }
   lastActiveSeconds = fft.activeSeconds || 0;
+
+  // Accumulate peak energy across all incoming FFT frames between waterfall column shifts
+  if (fft.liveBins) {
+    if (!wfPendingBins || wfPendingBins.length !== fft.liveBins.length) {
+      wfPendingBins = Float32Array.from(fft.liveBins);
+    } else {
+      for (let i = 0; i < fft.liveBins.length; i++) {
+        if (fft.liveBins[i] > wfPendingBins[i]) {
+          wfPendingBins[i] = fft.liveBins[i];
+        }
+      }
+    }
+  }
 
   latestSampleRate = fft.sampleRate || 48000;
   updateButtons(true);
