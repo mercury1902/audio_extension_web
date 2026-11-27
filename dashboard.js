@@ -20,6 +20,24 @@ function sanitizeFftSize(val) {
   const n = Number(val);
   return VALID_FFT_SIZES.has(n) ? n : DEFAULT_FFT_SIZE;
 }
+
+function resampleMaxHold(oldHold, oldFftSize, newBins, newFftSize) {
+  const next = new Float32Array(newBins).fill(-140);
+  if (!oldHold || !oldHold.length) return next;
+  const oldLen = oldHold.length;
+  const gainAdjust = newFftSize > oldFftSize ? 10 * Math.log10(oldFftSize / newFftSize) : 0;
+
+  for (let i = 0; i < newBins; i++) {
+    const start = Math.floor((i * oldLen) / newBins);
+    const end = Math.min(oldLen, Math.max(start + 1, Math.ceil(((i + 1) * oldLen) / newBins)));
+    let peak = -140;
+    for (let j = start; j < end; j++) {
+      if (oldHold[j] > peak) peak = oldHold[j];
+    }
+    next[i] = peak > -135 ? Math.max(-140, peak + gainAdjust) : -140;
+  }
+  return next;
+}
 const ANALYSIS_MS = 120;
 const DISPLAY_BINS = 112;
 
@@ -485,6 +503,7 @@ class SpectralProbe {
     this.remoteTarget = null;
     this.lastRemoteTs = 0;
     this.lastRemoteActiveSec = 0;
+    this.lastRemoteResetSeq = null;
 
     this.lastTrackKey = "";
 
@@ -705,12 +724,11 @@ class SpectralProbe {
 
   setFftSize(newSize) {
     const valid = sanitizeFftSize(newSize);
+    const prevFftSize = this.fftSize;
     this.fftSize = valid;
     if (this.wfFftSelect) this.wfFftSelect.value = String(valid);
 
     if (this.isRemote) {
-      this.smoothMax = null;
-      this.smoothCutoffHz = null;
       chrome.runtime.sendMessage({
         target: "background",
         type: "SET_FFT_SIZE",
@@ -726,12 +744,17 @@ class SpectralProbe {
     }
 
     if (this.analyser) {
+      const prevMaxHold = this.maxHold;
       this.analyser.fftSize = valid;
       const bins = this.analyser.frequencyBinCount;
       this.freqData = new Float32Array(bins);
-      this.maxHold = new Float32Array(bins).fill(-140);
+      this.maxHold = resampleMaxHold(prevMaxHold, prevFftSize, bins, valid);
       this.wfPendingBins = null;
-      this.resetMaxHoldOnly();
+      const res = detectCutoffHz(this.maxHold, this.sampleRate, this.fftSize);
+      if (res.cutoffHz) {
+        this.cutoffHz = res.cutoffHz;
+        this.isBrickwall = res.isBrickwall;
+      }
       this.updateTextUi();
     }
     updateBottomStatusBar();
@@ -1051,10 +1074,19 @@ class SpectralProbe {
   }
 
   ingestRemoteFrame(payload) {
-    if (payload.activeSeconds < this.lastRemoteActiveSec - 0.5) {
+    const hasExplicitReset =
+      payload.resetSeq != null &&
+      this.lastRemoteResetSeq != null &&
+      payload.resetSeq !== this.lastRemoteResetSeq;
+    const hasFallbackReset =
+      payload.resetSeq == null &&
+      payload.activeSeconds < this.lastRemoteActiveSec - 0.5;
+
+    if (hasExplicitReset || hasFallbackReset) {
       this.resetAnimBuffers();
       this.clearWaterfall();
     }
+    if (payload.resetSeq != null) this.lastRemoteResetSeq = payload.resetSeq;
     this.lastRemoteActiveSec = payload.activeSeconds || 0;
     this.remoteTarget = payload;
     this.lastRemoteTs = performance.now();

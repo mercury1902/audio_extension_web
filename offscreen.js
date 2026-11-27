@@ -25,6 +25,7 @@ let cachedRefDb = -140;
 let cachedIsBrickwall = false;
 let latestFrame = null;
 let wfHistory = [];
+let resetSeq = 0;
 
 // Rolling Dynamic Range, Phase Correlation & ITU-R BS.1770-4 LUFS states
 let smoothCrestDb = null;
@@ -57,7 +58,28 @@ const ISO_31_BANDS = [
   12500, 16000, 20000,
 ];
 
+function resampleMaxHold(oldHold, oldFftSize, newBins, newFftSize) {
+  const next = new Float32Array(newBins).fill(-140);
+  if (!oldHold || !oldHold.length) return next;
+  const oldLen = oldHold.length;
+  // When increasing FFT size, narrow bins naturally drop broadband energy (~3 dB/octave).
+  // Gently offset downward so old wider-bin floors don't linger above the new narrower curve.
+  const gainAdjust = newFftSize > oldFftSize ? 10 * Math.log10(oldFftSize / newFftSize) : 0;
+
+  for (let i = 0; i < newBins; i++) {
+    const start = Math.floor((i * oldLen) / newBins);
+    const end = Math.min(oldLen, Math.max(start + 1, Math.ceil(((i + 1) * oldLen) / newBins)));
+    let peak = -140;
+    for (let j = start; j < end; j++) {
+      if (oldHold[j] > peak) peak = oldHold[j];
+    }
+    next[i] = peak > -135 ? Math.max(-140, peak + gainAdjust) : -140;
+  }
+  return next;
+}
+
 function resetSpectrum() {
+  resetSeq += 1;
   if (analyser) {
     maxHold = new Float32Array(analyser.frequencyBinCount).fill(-140);
   }
@@ -435,6 +457,7 @@ function analyzeTick() {
   latestFrame = {
     capturing: true,
     tabId: capturedTabId,
+    resetSeq,
     fftSize: currentFftSize,
     sampleRate,
     nyquist: sampleRate / 2,
@@ -462,17 +485,22 @@ function analyzeTick() {
 function setFftSize(newSize) {
   const valid = sanitizeFftSize(newSize);
   if (valid === currentFftSize && analyser) return currentFftSize;
+  const prevFftSize = currentFftSize;
   currentFftSize = valid;
   if (analyser) {
+    const prevMaxHold = maxHold;
     analyser.fftSize = currentFftSize;
-    freqData = new Float32Array(analyser.frequencyBinCount);
-    maxHold = new Float32Array(analyser.frequencyBinCount).fill(-140);
-    totalFrames = 0;
-    activeFrames = 0;
-    overallMaxDb = -160;
-    cachedCutoffHz = null;
-    cachedRefDb = -140;
-    cachedIsBrickwall = false;
+    const newBins = analyser.frequencyBinCount;
+    freqData = new Float32Array(newBins);
+    maxHold = resampleMaxHold(prevMaxHold, prevFftSize, newBins, currentFftSize);
+    // Preserve activeFrames, totalFrames, wfHistory, LUFS & Stereo state so switching
+    // FFT resolution never clears the running spectrogram or resets sample time.
+    const res = detectCutoffHz(maxHold, sampleRate, currentFftSize);
+    if (res.cutoffHz) {
+      cachedCutoffHz = res.cutoffHz;
+      cachedRefDb = res.refDb;
+      cachedIsBrickwall = res.isBrickwall;
+    }
   }
   return currentFftSize;
 }
@@ -545,6 +573,7 @@ async function startCapture(tabId, streamId, requestedFftSize) {
   maxHold = new Float32Array(analyser.frequencyBinCount).fill(-140);
 
   capturedTabId = tabId;
+  resetSeq += 1;
   totalFrames = 0;
   activeFrames = 0;
   overallMaxDb = -160;
@@ -912,6 +941,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         : {
             capturing: Boolean(mediaStream),
             tabId: capturedTabId,
+            resetSeq,
             fftSize: currentFftSize,
             sampleRate,
             nyquist: sampleRate / 2,

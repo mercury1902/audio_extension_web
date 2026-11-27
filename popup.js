@@ -4,6 +4,7 @@ let latestLayer1 = null;
 let latestSampleRate = null;
 let isCapturingCurrentTab = false;
 let lastActiveSeconds = 0;
+let lastResetSeq = null;
 let spectrumScale = "lin"; // "lin" | "log"
 let fullScanResult = null;
 let isScanningFull = false;
@@ -1266,6 +1267,7 @@ function stopRenderLoop() {
   targetFft = null;
   wfPendingBins = null;
   lastActiveSeconds = 0;
+  lastResetSeq = null;
   resetAnimBuffers();
 }
 
@@ -1300,12 +1302,23 @@ function ingestFftFrame(fft, isInitialState = false) {
     return;
   }
 
+  const hasExplicitReset =
+    !isInitialState &&
+    fft.resetSeq != null &&
+    lastResetSeq != null &&
+    fft.resetSeq !== lastResetSeq;
+  const hasFallbackReset =
+    !isInitialState &&
+    fft.resetSeq == null &&
+    (fft.activeSeconds || 0) < lastActiveSeconds - 0.5;
+
   if (isInitialState && Array.isArray(fft.wfHistory) && fft.wfHistory.length) {
     hydrateWaterfall(fft.wfHistory);
-  } else if ((fft.activeSeconds || 0) < lastActiveSeconds - 0.5) {
+  } else if (hasExplicitReset || hasFallbackReset) {
     resetAnimBuffers();
     clearWaterfall();
   }
+  if (fft.resetSeq != null) lastResetSeq = fft.resetSeq;
   lastActiveSeconds = fft.activeSeconds || 0;
 
   if (fft.liveBins) {
@@ -1445,8 +1458,6 @@ document.getElementById("wfFftSelect").addEventListener("change", (e) => {
     return;
   }
   if (isCapturingCurrentTab) {
-    smoothMax = null;
-    smoothCutoffHz = null;
     chrome.runtime.sendMessage({
       target: "background",
       type: "SET_FFT_SIZE",
