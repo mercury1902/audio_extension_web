@@ -5,8 +5,9 @@ let activeFftTabId = null;
 const tabDirectMediaMeta = new Map();
 const fetchedHlsUrls = new Set();
 
-// Cache exact byte size for local file:// URLs resolved via Service Worker fetch()
-const localFileByteCache = new Map(); // url -> number | "pending"
+// Cache exact byte size + parsed native header metadata for local file:// URLs
+// url -> { size, sampleRate, bitDepth, channels, md5 } | "pending"
+const localFileMetaCache = new Map();
 
 function formatBadge(kbps) {
   if (kbps >= 1000) return `${(kbps / 1000).toFixed(1)}M`;
@@ -51,23 +52,165 @@ function getTabMetaMap(tabId) {
   return map;
 }
 
-// Resolve exact file size in bytes for local file:// audio files (requires "Allow access to file URLs")
-function resolveLocalFileSize(url) {
-  if (!url || !url.startsWith("file://")) return 0;
-  const cached = localFileByteCache.get(url);
-  if (typeof cached === "number") return cached;
-  if (cached === "pending") return 0;
+function readAscii(view, offset, len) {
+  let out = "";
+  for (let i = 0; i < len && offset + i < view.byteLength; i++) {
+    out += String.fromCharCode(view.getUint8(offset + i));
+  }
+  return out;
+}
 
-  localFileByteCache.set(url, "pending");
+// Pure JS Byte Parser for native FLAC STREAMINFO and WAV fmt headers
+function parseAudioHeader(arrayBuffer) {
+  if (!arrayBuffer || arrayBuffer.byteLength < 36) return null;
+  const view = new DataView(arrayBuffer);
+
+  // FLAC: starts with "fLaC"
+  if (readAscii(view, 0, 4) === "fLaC") {
+    let offset = 4;
+    while (offset + 4 <= view.byteLength) {
+      const headerByte = view.getUint8(offset);
+      const isLast = (headerByte & 0x80) !== 0;
+      const blockType = headerByte & 0x7f;
+      const blockLen =
+        (view.getUint8(offset + 1) << 16) |
+        (view.getUint8(offset + 2) << 8) |
+        view.getUint8(offset + 3);
+      offset += 4;
+
+      if (blockType === 0 && offset + 34 <= view.byteLength) {
+        const b10 = view.getUint8(offset + 10);
+        const b11 = view.getUint8(offset + 11);
+        const b12 = view.getUint8(offset + 12);
+        const b13 = view.getUint8(offset + 13);
+
+        const sampleRate = (b10 << 12) | (b11 << 4) | (b12 >> 4);
+        const channels = ((b12 >> 1) & 0x07) + 1;
+        const bitDepth = (((b12 & 0x01) << 4) | (b13 >> 4)) + 1;
+
+        let md5 = "";
+        let nonZero = false;
+        for (let i = 0; i < 16; i++) {
+          const b = view.getUint8(offset + 18 + i);
+          if (b !== 0) nonZero = true;
+          md5 += b.toString(16).padStart(2, "0");
+        }
+
+        return {
+          sampleRate: sampleRate > 0 ? sampleRate : 0,
+          bitDepth: bitDepth > 0 ? bitDepth : 0,
+          channels: channels > 0 ? channels : 0,
+          md5: nonZero ? md5 : "",
+        };
+      }
+
+      offset += blockLen;
+      if (isLast || blockLen <= 0) break;
+    }
+    return null;
+  }
+
+  // WAV: RIFF .... WAVE
+  if (readAscii(view, 0, 4) === "RIFF" && readAscii(view, 8, 4) === "WAVE") {
+    let offset = 12;
+    while (offset + 8 <= view.byteLength) {
+      const chunkId = readAscii(view, offset, 4);
+      const chunkSize = view.getUint32(offset + 4, true);
+      offset += 8;
+
+      if (chunkId === "fmt " && offset + 16 <= view.byteLength) {
+        const channels = view.getUint16(offset + 2, true);
+        const sampleRate = view.getUint32(offset + 4, true);
+        const bitDepth = view.getUint16(offset + 14, true);
+        return {
+          sampleRate: sampleRate > 0 ? sampleRate : 0,
+          bitDepth: bitDepth > 0 ? bitDepth : 0,
+          channels: channels > 0 ? channels : 0,
+          md5: "",
+        };
+      }
+
+      offset += chunkSize + (chunkSize % 2);
+      if (chunkSize === 0) break;
+    }
+    return null;
+  }
+
+  return null;
+}
+
+// Resolve exact file size + native FLAC/WAV header metadata for local file:// URLs
+function resolveLocalFileMeta(url, tabId) {
+  if (!url || !url.startsWith("file://")) return null;
+  const cached = localFileMetaCache.get(url);
+  if (cached && cached !== "pending") return cached;
+  if (cached === "pending") return null;
+
+  localFileMetaCache.set(url, "pending");
   fetch(url)
-    .then((resp) => resp.blob())
-    .then((blob) => {
-      localFileByteCache.set(url, blob && blob.size > 0 ? blob.size : 0);
+    .then(async (resp) => {
+      const blob = await resp.blob();
+      const size = blob && blob.size > 0 ? blob.size : 0;
+      let header = null;
+      try {
+        const headBuf = await blob.slice(0, 65536).arrayBuffer();
+        header = parseAudioHeader(headBuf);
+      } catch {
+        // Ignore header parse errors
+      }
+
+      const meta = {
+        size,
+        sampleRate: header?.sampleRate || 0,
+        bitDepth: header?.bitDepth || 0,
+        channels: header?.channels || 0,
+        md5: header?.md5 || "",
+      };
+      localFileMetaCache.set(url, meta);
+
+      // Immediately patch stored telemetry for this tab if present
+      if (tabId != null) {
+        const key = `tab_${tabId}`;
+        chrome.storage.session.get(key, (res) => {
+          const existing = res[key];
+          if (!existing || existing.srcUrl !== url) return;
+          const dur = existing.lastDeltaSec || 0;
+          const kbps =
+            size > 0 && dur > 0.5 ? Math.round((size * 8) / dur / 1000) : existing.avgKbps;
+          const updated = {
+            ...existing,
+            lastChunkBytes: size || existing.lastChunkBytes,
+            avgKbps: kbps,
+            instantKbps: kbps,
+            peakKbps: Math.max(existing.peakKbps || 0, kbps),
+            nativeSampleRate: meta.sampleRate,
+            nativeBitDepth: meta.bitDepth,
+            nativeChannels: meta.channels,
+            nativeMd5: meta.md5,
+            updatedAt: Date.now(),
+          };
+          chrome.storage.session.set({ [key]: updated });
+          if (kbps >= 8) {
+            chrome.action.setBadgeText({ tabId, text: formatBadge(kbps) });
+            chrome.action.setBadgeBackgroundColor({
+              tabId,
+              color: getBadgeColor(updated.codec, kbps),
+            });
+          }
+        });
+      }
     })
     .catch(() => {
-      localFileByteCache.set(url, 0);
+      localFileMetaCache.set(url, {
+        size: 0,
+        sampleRate: 0,
+        bitDepth: 0,
+        channels: 0,
+        md5: "",
+      });
     });
-  return 0;
+
+  return null;
 }
 
 // Parse HLS .m3u8 playlist to extract highest variant BANDWIDTH & CODECS
@@ -115,7 +258,7 @@ async function inspectHlsPlaylist(tabId, url) {
   }
 }
 
-// Capture HTTP headers for Direct Audio & HLS streams (include extraHeaders for cross-origin Content-Length)
+// Capture HTTP headers for Direct Audio & HLS streams
 chrome.webRequest.onHeadersReceived.addListener(
   (details) => {
     if (details.tabId < 0 || !details.responseHeaders) return;
@@ -238,7 +381,7 @@ async function ensureOffscreenDocument() {
   await chrome.offscreen.createDocument({
     url: "offscreen.html",
     reasons: ["USER_MEDIA"],
-    justification: "Real-time FFT spectral analysis for the active tab audio stream.",
+    justification: "Real-time FFT, LUFS, stereo phase, and offline full-track spectral analysis.",
   });
 }
 
@@ -292,9 +435,9 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const meta = metaMap?.get(urlKey) || metaMap?.get("__HLS_LATEST__") || null;
 
       const isLocalFile = p.src.startsWith("file://");
-      const bgLocalBytes = isLocalFile ? resolveLocalFileSize(p.src) : 0;
+      const bgMeta = isLocalFile ? resolveLocalFileMeta(p.src, tabId) : null;
       const totalBytes =
-        bgLocalBytes || p.exactBytes || meta?.totalBytes || p.transferSize || 0;
+        bgMeta?.size || p.exactBytes || meta?.totalBytes || p.transferSize || 0;
 
       const codec =
         meta?.codecOverride || inferCodecFromMimeOrUrl(meta?.contentType || "", p.src);
@@ -328,6 +471,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       const telemetry = {
         streamMode,
         streamId: urlKey,
+        srcUrl: p.src,
         codec,
         mimeType,
         instantKbps: kbps,
@@ -340,6 +484,10 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         trackTitle: p.trackTitle || existing?.trackTitle || "",
         trackArtist: p.trackArtist || existing?.trackArtist || "",
         host: p.host || "",
+        nativeSampleRate: bgMeta?.sampleRate || existing?.nativeSampleRate || 0,
+        nativeBitDepth: bgMeta?.bitDepth || existing?.nativeBitDepth || 0,
+        nativeChannels: bgMeta?.channels || existing?.nativeChannels || 0,
+        nativeMd5: bgMeta?.md5 || existing?.nativeMd5 || "",
         updatedAt: Date.now(),
       };
 
@@ -461,7 +609,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       .sendMessage({ target: "offscreen", type: "OFFSCREEN_RESET" })
       .catch(() => {});
     sendResponse({ ok: true });
-    return;
+    return true;
   }
 
   if (message.type === "GET_FFT_STATE") {
@@ -478,6 +626,25 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         sendResponse(state || { capturing: false, tabId: null });
       } catch {
         sendResponse({ capturing: false, tabId: null });
+      }
+    })();
+    return true;
+  }
+
+  if (message.type === "SCAN_FULL_TRACK") {
+    (async () => {
+      try {
+        await ensureOffscreenDocument();
+        const resp = await chrome.runtime.sendMessage({
+          target: "offscreen",
+          type: "OFFSCREEN_SCAN_FULL",
+          tabId: message.tabId,
+          url: message.url,
+          nativeSampleRate: message.nativeSampleRate || 0,
+        });
+        sendResponse(resp || { ok: false, error: "Empty response from scanner" });
+      } catch (err) {
+        sendResponse({ ok: false, error: err?.message || String(err) });
       }
     })();
     return true;

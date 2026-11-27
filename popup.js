@@ -5,6 +5,8 @@ let latestSampleRate = null;
 let isCapturingCurrentTab = false;
 let lastActiveSeconds = 0;
 let spectrumScale = "lin"; // "lin" | "log"
+let fullScanResult = null;
+let isScanningFull = false;
 
 const canvas = document.getElementById("fftCanvas");
 const ctx = canvas.getContext("2d");
@@ -28,10 +30,15 @@ let smoothMax = null;
 let peakCaps = null;
 let smoothCutoffHz = null;
 
-// Level meter smoothing state
-let smoothRmsDbfs = -100;
-let smoothPeakDbfs = -100;
-let heldPeakDbfs = -100;
+// Stereo Level + Phase meter smoothing state
+let smoothPeakL = -100;
+let smoothPeakR = -100;
+let smoothRmsL = -100;
+let smoothRmsR = -100;
+let heldPeakL = -100;
+let heldPeakR = -100;
+let smoothPhase = 0;
+let hasPhaseData = false;
 
 let rafId = null;
 let lastRenderTs = 0;
@@ -53,8 +60,8 @@ const LOG_31_LABELS = [
 const WF_WIDTH = 420;
 const WF_HEIGHT = 152;
 const WF_COLS_PER_SEC = 32;
-const WF_MAX_DB = -24; // Per-bin 8192-pt FFT peak ceiling for bold mid/high contrast
-const WF_GAMMA = 0.72; // Perceptual curve boosting mid-level harmonics without lifting floor
+const WF_MAX_DB = -24;
+const WF_GAMMA = 0.72;
 
 const wfCanvas = document.createElement("canvas");
 wfCanvas.width = WF_WIDTH;
@@ -71,6 +78,20 @@ let wfHasData = false;
 let wfPaletteName = "inferno";
 let wfMinDb = -105;
 let wfHover = { active: false, normX: 0, normY: 0 };
+
+function formatDuration(sec) {
+  const s = Math.max(0, Math.round(sec || 0));
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  return `${m}:${String(rem).padStart(2, "0")}`;
+}
+
+function formatDurationPrecise(sec) {
+  const s = Math.max(0, sec || 0);
+  const m = Math.floor(s / 60);
+  const rem = (s - m * 60).toFixed(1).padStart(4, "0");
+  return `${m}:${rem}`;
+}
 
 function buildPaletteLut(stops) {
   const lut = new Uint8Array(256 * 3);
@@ -275,7 +296,6 @@ function pushWaterfallColumn(freqArr, isQuantizedByte = false) {
   wfDbBuffer.copyWithin(0, WF_HEIGHT);
   const newestColOffset = (WF_WIDTH - 1) * WF_HEIGHT;
 
-  // Subtle 1px vertical harmonic thickening (foobar2000-style rich body)
   for (let y = 0; y < WF_HEIGHT; y++) {
     let db = wfColRaw[y];
     if (y > 0 && wfColRaw[y - 1] - 3.5 > db) db = wfColRaw[y - 1] - 3.5;
@@ -296,6 +316,44 @@ function pushWaterfallColumn(freqArr, isQuantizedByte = false) {
   wfHasData = true;
 }
 
+function loadFullScanWaterfall(wfCols) {
+  wfDbBuffer.fill(-140);
+  if (!Array.isArray(wfCols) || !wfCols.length) {
+    clearWaterfall();
+    return;
+  }
+
+  const numSrcCols = wfCols.length;
+  for (let col = 0; col < WF_WIDTH; col++) {
+    const srcIdx = Math.min(numSrcCols - 1, Math.floor((col / WF_WIDTH) * numSrcCols));
+    const freqArr = wfCols[srcIdx];
+    const srcLen = freqArr.length;
+
+    for (let y = 0; y < WF_HEIGHT; y++) {
+      const freqTop = 1 - y / WF_HEIGHT;
+      const freqBot = 1 - (y + 1) / WF_HEIGHT;
+      const bStart = Math.max(0, Math.floor(freqBot * (srcLen - 1)));
+      const bEnd = Math.min(srcLen - 1, Math.max(bStart, Math.ceil(freqTop * (srcLen - 1))));
+      let maxDb = -140;
+      for (let b = bStart; b <= bEnd; b++) {
+        if (freqArr[b] > maxDb) maxDb = freqArr[b];
+      }
+      wfColRaw[y] = maxDb;
+    }
+
+    const colOffset = col * WF_HEIGHT;
+    for (let y = 0; y < WF_HEIGHT; y++) {
+      let db = wfColRaw[y];
+      if (y > 0 && wfColRaw[y - 1] - 3.5 > db) db = wfColRaw[y - 1] - 3.5;
+      if (y < WF_HEIGHT - 1 && wfColRaw[y + 1] - 3.5 > db) db = wfColRaw[y + 1] - 3.5;
+      wfDbBuffer[colOffset + y] = db;
+    }
+  }
+
+  wfHasData = true;
+  repaintWaterfallFromDbBuffer();
+}
+
 function hydrateWaterfall(historyCols) {
   clearWaterfall();
   if (!Array.isArray(historyCols) || !historyCols.length) return;
@@ -312,14 +370,19 @@ function resetAnimBuffers() {
   smoothMax = null;
   peakCaps = null;
   smoothCutoffHz = null;
-  smoothRmsDbfs = -100;
-  smoothPeakDbfs = -100;
-  heldPeakDbfs = -100;
+  smoothPeakL = -100;
+  smoothPeakR = -100;
+  smoothRmsL = -100;
+  smoothRmsR = -100;
+  heldPeakL = -100;
+  heldPeakR = -100;
+  smoothPhase = 0;
+  hasPhaseData = false;
 }
 
 function updateStatusBar() {
   const summaryEl = document.getElementById("statusSummary");
-  if (!latestLayer1 && !isCapturingCurrentTab) {
+  if (!latestLayer1 && !isCapturingCurrentTab && !fullScanResult) {
     summaryEl.textContent = "IDLE | Waiting for audio stream...";
     return;
   }
@@ -327,17 +390,29 @@ function updateStatusBar() {
   if (latestLayer1) {
     parts.push(latestLayer1.codec.toUpperCase());
     parts.push(latestLayer1.avgKbps > 0 ? `${latestLayer1.avgKbps} kbps` : "LIVE");
-    if (latestLayer1.streamMode) parts.push(latestLayer1.streamMode);
+    if (latestLayer1.nativeBitDepth) parts.push(`${latestLayer1.nativeBitDepth}-bit`);
+    if (latestLayer1.nativeSampleRate) {
+      parts.push(`${(latestLayer1.nativeSampleRate / 1000).toFixed(1)} kHz`);
+    } else if (latestSampleRate) {
+      parts.push(`${(latestSampleRate / 1000).toFixed(1)} kHz`);
+    }
   } else {
     parts.push("AUDIO");
+    if (latestSampleRate) parts.push(`${(latestSampleRate / 1000).toFixed(1)} kHz`);
   }
-  if (latestSampleRate) {
-    parts.push(`${latestSampleRate} Hz`);
+
+  const activeSource = fullScanResult || (isCapturingCurrentTab ? targetFft : null);
+  if (activeSource?.integratedLufs != null) {
+    parts.push(`${activeSource.integratedLufs.toFixed(1)} LUFS`);
+  } else if (activeSource?.crestDb != null) {
+    parts.push(`DR ${activeSource.crestDb.toFixed(1)} dB`);
   }
-  if (targetFft?.crestDb != null && isCapturingCurrentTab) {
-    parts.push(`DR ${targetFft.crestDb.toFixed(1)} dB`);
+
+  if (fullScanResult) {
+    parts.push(`FULL SCAN (${fullScanResult.scanMs}ms)`);
+  } else {
+    parts.push(isCapturingCurrentTab ? "FFT + SPEK ON" : "FFT OFF");
   }
-  parts.push(isCapturingCurrentTab ? "FFT + SPEK ON" : "FFT OFF");
   summaryEl.textContent = parts.join(" | ");
 }
 
@@ -371,6 +446,22 @@ function classifySource(codec, avgKbps) {
   return "Direct Stream";
 }
 
+function getLocalFileUrl() {
+  if (latestLayer1?.srcUrl && latestLayer1.srcUrl.startsWith("file://")) {
+    return latestLayer1.srcUrl;
+  }
+  if (currentTabUrl && currentTabUrl.startsWith("file://")) {
+    return currentTabUrl;
+  }
+  return "";
+}
+
+function updateScanButtonVisibility() {
+  const btn = document.getElementById("btnScanFull");
+  const isLocal = Boolean(getLocalFileUrl());
+  btn.classList.toggle("hidden", !isLocal);
+}
+
 function renderLayer1(data) {
   latestLayer1 = data;
   const emptyEl = document.getElementById("emptyState");
@@ -378,7 +469,10 @@ function renderLayer1(data) {
   const metaEl = document.getElementById("metaBox");
   const codecPill = document.getElementById("codecPill");
   const modePill = document.getElementById("modePill");
+  const nativeSpecPill = document.getElementById("nativeSpecPill");
   const trackBar = document.getElementById("trackBar");
+
+  updateScanButtonVisibility();
 
   if (!data) {
     if (currentTabUrl.startsWith("file://")) {
@@ -394,6 +488,7 @@ function renderLayer1(data) {
     liveEl.classList.add("hidden");
     metaEl.classList.add("hidden");
     modePill.classList.add("hidden");
+    nativeSpecPill.classList.add("hidden");
     codecPill.textContent = "IDLE";
     bitrateChart.update(null);
     updateStatusBar();
@@ -416,19 +511,34 @@ function renderLayer1(data) {
   modePill.textContent = (data.streamMode || "MSE").toUpperCase();
   modePill.classList.remove("hidden");
 
+  if (data.nativeBitDepth || data.nativeSampleRate) {
+    const bits = data.nativeBitDepth ? `${data.nativeBitDepth}-bit` : "";
+    const sr = data.nativeSampleRate ? `${(data.nativeSampleRate / 1000).toFixed(1)} kHz` : "";
+    nativeSpecPill.textContent = [bits, sr].filter(Boolean).join(" / ");
+    nativeSpecPill.title = data.nativeMd5
+      ? `Native Header | MD5: ${data.nativeMd5}`
+      : "Native File Header Metadata";
+    nativeSpecPill.classList.remove("hidden");
+  } else {
+    nativeSpecPill.classList.add("hidden");
+  }
+
   const hasRate = data.avgKbps > 0;
   document.getElementById("avgVal").textContent = hasRate ? data.avgKbps : "LIVE";
   document.getElementById("tierText").textContent = classifySource(data.codec, data.avgKbps);
   document.getElementById("instantVal").textContent = hasRate ? `${data.instantKbps} kbps` : "—";
   document.getElementById("peakVal").textContent = hasRate ? `${data.peakKbps} kbps` : "—";
-  document.getElementById("mimeVal").textContent = data.mimeType;
+  document.getElementById("mimeVal").textContent = data.nativeMd5
+    ? `${data.mimeType} | MD5 ${data.nativeMd5.slice(0, 8)}…`
+    : data.mimeType;
   document.getElementById("chunkInfo").textContent =
     data.lastChunkBytes > 0
       ? `${(data.lastChunkBytes / 1024).toFixed(1)} KB / ${data.lastDeltaSec}s (#${data.chunkCount})`
       : `${data.lastDeltaSec}s (#${data.chunkCount})`;
 
   bitrateChart.update(data);
-  if (targetFft) evaluateVerdict(targetFft);
+  if (fullScanResult) evaluateVerdict(fullScanResult);
+  else if (targetFft) evaluateVerdict(targetFft);
   updateStatusBar();
 }
 
@@ -459,14 +569,21 @@ function evaluateVerdict(fft) {
     return;
   }
 
-  if (fft.activeSeconds < 4.5 || !fft.cutoffHz) {
+  if (!fft.fullScan && (fft.activeSeconds < 4.5 || !fft.cutoffHz)) {
     verdictBox.className = "verdict";
     verdictBox.textContent = `Accumulating Max-Hold (${fft.activeSeconds.toFixed(1)}s / ~5s) — waiting for transients...`;
     return;
   }
 
-  const khz = (fft.cutoffHz / 1000).toFixed(1);
+  const khz = fft.cutoffHz ? (fft.cutoffHz / 1000).toFixed(1) : "—";
   const drPart = fft.crestDb != null ? `DR ${fft.crestDb.toFixed(1)} dB` : "DR —";
+  const lufsVal = fft.integratedLufs ?? fft.momentaryLufs;
+  const lufsPart = lufsVal != null ? ` | ${lufsVal.toFixed(1)} LUFS` : "";
+  const tpPart =
+    fft.truePeakDbtp != null && fft.truePeakDbtp > -90
+      ? ` | TP ${fft.truePeakDbtp.toFixed(1)} dBTP`
+      : "";
+
   const layer1Codec = latestLayer1?.codec || "";
   const reportedKbps = latestLayer1?.avgKbps || 0;
 
@@ -491,7 +608,7 @@ function evaluateVerdict(fft) {
   } else {
     verdictBox.className = "verdict fake";
   }
-  verdictBox.textContent = `~${khz} kHz | ${drPart}`;
+  verdictBox.textContent = `~${khz} kHz | ${drPart}${lufsPart}${tpPart}`;
 }
 
 function drawSpectrumFrame(nyquist, liveBins, maxBins, caps, cutoffHz) {
@@ -602,6 +719,8 @@ function drawSpectrumFrame(nyquist, liveBins, maxBins, caps, cutoffHz) {
       { hz: 16000, label: "16k", color: "rgba(214, 147, 45, 0.78)" },
       { hz: 20000, label: "20k", color: "rgba(61, 163, 93, 0.78)" },
       { hz: 22050, label: "22k", color: "rgba(176, 118, 214, 0.72)" },
+      { hz: 32000, label: "32k", color: "rgba(135, 135, 135, 0.45)" },
+      { hz: 40000, label: "40k", color: "rgba(176, 118, 214, 0.65)" },
     ];
 
     ctx.save();
@@ -609,7 +728,7 @@ function drawSpectrumFrame(nyquist, liveBins, maxBins, caps, cutoffHz) {
     ctx.font = "9.5px Segoe UI, Tahoma, sans-serif";
     ctx.textAlign = "left";
     for (const m of markers) {
-      if (m.hz >= nyquist) continue;
+      if (m.hz >= nyquist - 400) continue;
       const x = Math.round((m.hz / nyquist) * plotW) + 0.5;
       ctx.strokeStyle = m.color;
       ctx.beginPath();
@@ -628,7 +747,7 @@ function drawSpectrumFrame(nyquist, liveBins, maxBins, caps, cutoffHz) {
     ctx.fillText(`${(nyquist / 1000).toFixed(0)}k`, plotW - 18, h - 3);
 
     if (cutoffHz) {
-      const cx = Math.round((cutoffHz / nyquist) * plotW) + 0.5;
+      const cx = Math.round((Math.min(cutoffHz, nyquist) / nyquist) * plotW) + 0.5;
       ctx.strokeStyle = "#3399ff";
       ctx.lineWidth = 1.5;
       ctx.beginPath();
@@ -639,55 +758,106 @@ function drawSpectrumFrame(nyquist, liveBins, maxBins, caps, cutoffHz) {
   }
 }
 
-function drawLevelMeter(peakDbfs, rmsDbfs, heldPeak, crestDb) {
-  const { w, h } = syncCanvasDpr(meterCanvas, meterCtx, 436, 22);
+function drawStereoPhaseMeter(m) {
+  const { w, h } = syncCanvasDpr(meterCanvas, meterCtx, 436, 38);
   meterCtx.clearRect(0, 0, w, h);
   meterCtx.fillStyle = "#161616";
   meterCtx.fillRect(0, 0, w, h);
 
-  const labelPadRight = 186;
-  const barW = Math.max(40, w - labelPadRight - 8);
-  const barX = 4;
-  const barY = 5;
-  const barH = h - 10;
-
-  meterCtx.fillStyle = "#101010";
-  meterCtx.fillRect(barX, barY, barW, barH);
-  meterCtx.strokeStyle = "#2c2c2c";
-  meterCtx.strokeRect(barX + 0.5, barY + 0.5, barW - 1, barH - 1);
+  const labelPadRight = 188;
+  const chLabelW = 14;
+  const barX = chLabelW + 4;
+  const barW = Math.max(50, w - labelPadRight - barX - 6);
 
   const dbToX = (db) => {
     const clamped = Math.max(-60, Math.min(0, db));
     return barX + ((clamped + 60) / 60) * barW;
   };
 
-  if (peakDbfs > -60) {
-    const px = dbToX(peakDbfs);
-    meterCtx.fillStyle = "rgba(82, 148, 207, 0.32)";
-    meterCtx.fillRect(barX, barY, Math.max(0, px - barX), barH);
+  const drawChannelBar = (label, y, barH, peakDb, rmsDb, heldDb) => {
+    meterCtx.font = "bold 9px Segoe UI, Tahoma, sans-serif";
+    meterCtx.textAlign = "left";
+    meterCtx.textBaseline = "middle";
+    meterCtx.fillStyle = "#8a8a8a";
+    meterCtx.fillText(label, 4, y + barH / 2 + 0.5);
+
+    meterCtx.fillStyle = "#101010";
+    meterCtx.fillRect(barX, y, barW, barH);
+    meterCtx.strokeStyle = "#2c2c2c";
+    meterCtx.strokeRect(barX + 0.5, y + 0.5, barW - 1, barH - 1);
+
+    if (peakDb > -60) {
+      const px = dbToX(peakDb);
+      meterCtx.fillStyle = "rgba(82, 148, 207, 0.34)";
+      meterCtx.fillRect(barX + 1, y + 1, Math.max(0, px - barX - 1), barH - 2);
+    }
+    if (rmsDb > -60) {
+      const rx = dbToX(rmsDb);
+      meterCtx.fillStyle = rmsDb > -6 ? "#d6932d" : "#5294cf";
+      meterCtx.fillRect(barX + 1, y + 1, Math.max(0, rx - barX - 1), barH - 2);
+    }
+    if (heldDb > -60) {
+      const hx = Math.round(dbToX(heldDb));
+      meterCtx.fillStyle = heldDb > -0.3 ? "#cf4646" : "#e6eef5";
+      meterCtx.fillRect(hx - 1, y + 1, 2, barH - 2);
+    }
+  };
+
+  drawChannelBar("L", 4, 8, m.peakL, m.rmsL, m.heldL);
+  drawChannelBar("R", 14, 8, m.peakR, m.rmsR, m.heldR);
+
+  // Stereo Phase Correlation bar (-1 to +1)
+  const phY = 26;
+  const phH = 8;
+  meterCtx.font = "bold 9px Segoe UI, Tahoma, sans-serif";
+  meterCtx.textAlign = "left";
+  meterCtx.textBaseline = "middle";
+  meterCtx.fillStyle = "#8a8a8a";
+  meterCtx.fillText("Φ", 4, phY + phH / 2 + 0.5);
+
+  meterCtx.fillStyle = "#101010";
+  meterCtx.fillRect(barX, phY, barW, phH);
+  meterCtx.strokeStyle = "#2c2c2c";
+  meterCtx.strokeRect(barX + 0.5, phY + 0.5, barW - 1, phH - 1);
+
+  const midX = barX + barW / 2;
+  meterCtx.strokeStyle = "#3a3a3a";
+  meterCtx.beginPath();
+  meterCtx.moveTo(Math.round(midX) + 0.5, phY + 1);
+  meterCtx.lineTo(Math.round(midX) + 0.5, phY + phH - 1);
+  meterCtx.stroke();
+
+  if (m.hasPhase) {
+    const clampedPh = Math.max(-1, Math.min(1, m.phase));
+    const phX = midX + clampedPh * (barW / 2 - 2);
+    const phColor = clampedPh < 0 ? "#cf4646" : clampedPh < 0.3 ? "#d6932d" : "#3da35d";
+
+    meterCtx.fillStyle = phColor;
+    if (clampedPh >= 0) {
+      meterCtx.fillRect(midX, phY + 2, Math.max(1, phX - midX), phH - 4);
+    } else {
+      meterCtx.fillRect(phX, phY + 2, Math.max(1, midX - phX), phH - 4);
+    }
+    meterCtx.fillStyle = "#ffffff";
+    meterCtx.fillRect(Math.round(phX) - 1, phY + 1, 2, phH - 2);
   }
 
-  if (rmsDbfs > -60) {
-    const rx = dbToX(rmsDbfs);
-    meterCtx.fillStyle = rmsDbfs > -6 ? "#d6932d" : "#5294cf";
-    meterCtx.fillRect(barX, barY, Math.max(0, rx - barX), barH);
-  }
+  // Right-side 2-line broadcast readout (True Peak, DR, LUFS, Phase)
+  const tpStr = m.truePeak > -90 ? `${m.truePeak.toFixed(1)}` : "-∞";
+  const drStr = m.crestDb != null ? `${m.crestDb.toFixed(1)}` : "—";
+  const hasInt = m.integratedLufs != null;
+  const lufsVal = hasInt ? m.integratedLufs : m.momentaryLufs;
+  const lufsTag = hasInt ? "I" : "M";
+  const lufsStr = lufsVal != null ? `${lufsTag} ${lufsVal.toFixed(1)} LUFS` : "LUFS —";
+  const phStr = m.hasPhase ? `${m.phase >= 0 ? "+" : ""}${m.phase.toFixed(2)}` : "—";
 
-  if (heldPeak > -60) {
-    const hx = Math.round(dbToX(heldPeak));
-    meterCtx.fillStyle = heldPeak > -0.5 ? "#cf4646" : "#e6eef5";
-    meterCtx.fillRect(hx - 1, barY, 2, barH);
-  }
-
-  const peakStr = peakDbfs > -90 ? `${peakDbfs.toFixed(1)}` : "-∞";
-  const rmsStr = rmsDbfs > -90 ? `${rmsDbfs.toFixed(1)}` : "-∞";
-  const drStr = crestDb != null ? `${crestDb.toFixed(1)}dB` : "—";
-
-  meterCtx.font = "10px Segoe UI, Tahoma, sans-serif";
+  meterCtx.font = "9.5px Segoe UI, Tahoma, sans-serif";
   meterCtx.textAlign = "right";
   meterCtx.textBaseline = "middle";
-  meterCtx.fillStyle = "#a8a8a8";
-  meterCtx.fillText(`Pk ${peakStr} | RMS ${rmsStr} | DR ${drStr}`, w - 5, h / 2);
+  meterCtx.fillStyle = m.truePeak > -0.2 ? "#f29696" : "#b8b8b8";
+  meterCtx.fillText(`TP ${tpStr} dBTP | DR ${drStr} dB`, w - 5, 11);
+  meterCtx.fillStyle = "#96c7f2";
+  meterCtx.fillText(`${lufsStr} | Φ ${phStr}`, w - 5, 27);
 }
 
 function getWaterfallLayout(w, h) {
@@ -703,7 +873,8 @@ function getWaterfallLayout(w, h) {
 function drawWaterfallFrame(nyquist, cutoffHz) {
   const { w, h } = syncCanvasDpr(wfViewCanvas, wfViewCtx, 436, 164);
   const { padLeft, padTop, plotW, plotH } = getWaterfallLayout(w, h);
-  const totalSec = WF_WIDTH / WF_COLS_PER_SEC;
+  const isFull = Boolean(fullScanResult);
+  const totalSec = isFull ? fullScanResult.duration : WF_WIDTH / WF_COLS_PER_SEC;
 
   wfViewCtx.clearRect(0, 0, w, h);
   wfViewCtx.fillStyle = "#181818";
@@ -718,33 +889,61 @@ function drawWaterfallFrame(nyquist, cutoffHz) {
   wfViewCtx.lineWidth = 1;
   wfViewCtx.strokeRect(padLeft + 0.5, padTop + 0.5, plotW - 1, plotH - 1);
 
-  // Bottom Time Axis ticks & subtle vertical grid (-12s -> 0s)
+  // Bottom Time Axis ticks & subtle vertical grid
   wfViewCtx.save();
   wfViewCtx.font = "9px Segoe UI, Tahoma, sans-serif";
   wfViewCtx.textBaseline = "alphabetic";
-  const stepSec = 2;
-  for (let s = 0; s <= Math.floor(totalSec); s += stepSec) {
-    const x = Math.round(padLeft + plotW - (s / totalSec) * plotW) + 0.5;
-    if (x < padLeft + 8) continue;
 
-    if (s > 0 && wfHasData) {
-      wfViewCtx.strokeStyle = "rgba(255, 255, 255, 0.08)";
+  if (isFull && totalSec > 0) {
+    const tickCount = 6;
+    for (let i = 0; i <= tickCount; i++) {
+      const frac = i / tickCount;
+      const x = Math.round(padLeft + frac * plotW) + 0.5;
+      const sec = frac * totalSec;
+
+      if (i > 0 && i < tickCount && wfHasData) {
+        wfViewCtx.strokeStyle = "rgba(255, 255, 255, 0.08)";
+        wfViewCtx.beginPath();
+        wfViewCtx.moveTo(x, padTop + 1);
+        wfViewCtx.lineTo(x, padTop + plotH - 1);
+        wfViewCtx.stroke();
+      }
+
+      wfViewCtx.strokeStyle = "#555555";
       wfViewCtx.beginPath();
-      wfViewCtx.moveTo(x, padTop + 1);
-      wfViewCtx.lineTo(x, padTop + plotH - 1);
+      wfViewCtx.moveTo(x, padTop + plotH);
+      wfViewCtx.lineTo(x, padTop + plotH + 3);
       wfViewCtx.stroke();
+
+      wfViewCtx.fillStyle = "#7a7a7a";
+      wfViewCtx.textAlign = i === 0 ? "left" : i === tickCount ? "right" : "center";
+      wfViewCtx.fillText(formatDuration(sec), x, h - 3);
     }
+  } else {
+    const stepSec = 2;
+    for (let s = 0; s <= Math.floor(totalSec); s += stepSec) {
+      const x = Math.round(padLeft + plotW - (s / totalSec) * plotW) + 0.5;
+      if (x < padLeft + 8) continue;
 
-    wfViewCtx.strokeStyle = "#555555";
-    wfViewCtx.beginPath();
-    wfViewCtx.moveTo(x, padTop + plotH);
-    wfViewCtx.lineTo(x, padTop + plotH + 3);
-    wfViewCtx.stroke();
+      if (s > 0 && wfHasData) {
+        wfViewCtx.strokeStyle = "rgba(255, 255, 255, 0.08)";
+        wfViewCtx.beginPath();
+        wfViewCtx.moveTo(x, padTop + 1);
+        wfViewCtx.lineTo(x, padTop + plotH - 1);
+        wfViewCtx.stroke();
+      }
 
-    wfViewCtx.fillStyle = "#7a7a7a";
-    wfViewCtx.textAlign = s === 0 ? "right" : "center";
-    const lbl = s === 0 ? "0s" : `-${s}s`;
-    wfViewCtx.fillText(lbl, s === 0 ? padLeft + plotW : x, h - 3);
+      wfViewCtx.strokeStyle = "#555555";
+      wfViewCtx.beginPath();
+      wfViewCtx.moveTo(x, padTop + plotH);
+      wfViewCtx.lineTo(x, padTop + plotH + 3);
+      wfViewCtx.stroke();
+
+      wfViewCtx.fillStyle = "#7a7a7a";
+      wfViewCtx.textAlign = s === 0 ? "right" : "center";
+      const lbl = s === 0 ? "0s" : `-${s}s`;
+      wfViewCtx.fillText(lbl, s === 0 ? padLeft + plotW : x, h - 3);
+    }
   }
   wfViewCtx.restore();
 
@@ -755,6 +954,8 @@ function drawWaterfallFrame(nyquist, cutoffHz) {
     { hz: 16000, label: "16k", color: "rgba(214, 147, 45, 0.65)", text: "#d6932d" },
     { hz: 20000, label: "20k", color: "rgba(61, 163, 93, 0.72)", text: "#5cc47b" },
     { hz: 22050, label: "22k", color: "rgba(176, 118, 214, 0.58)", text: "#c494e6" },
+    { hz: 32000, label: "32k", color: "rgba(160, 160, 160, 0.28)", text: "#969696" },
+    { hz: 40000, label: "40k", color: "rgba(176, 118, 214, 0.58)", text: "#c494e6" },
   ];
 
   wfViewCtx.save();
@@ -851,8 +1052,14 @@ function drawWaterfallFrame(nyquist, cutoffHz) {
     const freqHz = (1 - wfHover.normY) * nyquist;
     const freqStr =
       freqHz >= 1000 ? `${(freqHz / 1000).toFixed(2)} kHz` : `${Math.round(freqHz)} Hz`;
-    const timeAgo = (1 - wfHover.normX) * totalSec;
-    const timeStr = timeAgo < 0.05 ? "0.0s" : `-${timeAgo.toFixed(1)}s`;
+
+    let timeStr = "";
+    if (isFull) {
+      timeStr = formatDurationPrecise(wfHover.normX * totalSec);
+    } else {
+      const timeAgo = (1 - wfHover.normX) * totalSec;
+      timeStr = timeAgo < 0.05 ? "0.0s" : `-${timeAgo.toFixed(1)}s`;
+    }
 
     const col = Math.max(0, Math.min(WF_WIDTH - 1, Math.floor(wfHover.normX * WF_WIDTH)));
     const row = Math.max(0, Math.min(WF_HEIGHT - 1, Math.floor(wfHover.normY * WF_HEIGHT)));
@@ -889,22 +1096,49 @@ function drawWaterfallFrame(nyquist, cutoffHz) {
     wfViewCtx.textAlign = "center";
     wfViewCtx.textBaseline = "middle";
     wfViewCtx.fillText(
-      "Spek Waterfall — Click 'Start FFT' above to begin",
+      "Spek Waterfall — Click 'Start FFT' or 'Scan Full' above",
       padLeft + plotW / 2,
       padTop + plotH / 2
     );
   }
 }
 
+function renderFullScanSnapshot() {
+  if (!fullScanResult) return;
+  const r = fullScanResult;
+  const nyquist = r.nyquist || 24000;
+  const live = spectrumScale === "log" ? r.logLiveBins : r.liveBins;
+  const max = spectrumScale === "log" ? r.logMaxBins : r.maxBins;
+
+  drawSpectrumFrame(nyquist, live, max, null, r.cutoffHz);
+  drawStereoPhaseMeter({
+    peakL: r.peakLDbfs ?? -100,
+    peakR: r.peakRDbfs ?? -100,
+    rmsL: r.rmsLDbfs ?? -100,
+    rmsR: r.rmsRDbfs ?? -100,
+    heldL: r.peakLDbfs ?? -100,
+    heldR: r.peakRDbfs ?? -100,
+    truePeak: r.truePeakDbtp ?? -100,
+    crestDb: r.crestDb ?? null,
+    phase: r.phaseCorr ?? 0,
+    hasPhase: r.phaseCorr != null,
+    momentaryLufs: r.momentaryLufs ?? null,
+    integratedLufs: r.integratedLufs ?? null,
+  });
+  drawWaterfallFrame(nyquist, r.cutoffHz);
+}
+
 function redrawWaterfallIdleIfNeeded() {
-  if (!rafId) {
+  if (fullScanResult) {
+    drawWaterfallFrame(fullScanResult.nyquist || 24000, fullScanResult.cutoffHz);
+  } else if (!rafId) {
     const nyquist = targetFft?.nyquist || (latestSampleRate ? latestSampleRate / 2 : 24000);
     drawWaterfallFrame(nyquist, smoothCutoffHz);
   }
 }
 
 function renderLoop(now) {
-  if (!isCapturingCurrentTab || !targetFft) {
+  if (!isCapturingCurrentTab || !targetFft || fullScanResult) {
     rafId = null;
     return;
   }
@@ -966,20 +1200,24 @@ function renderLoop(now) {
     }
   }
 
-  const targetPeak = targetFft.peakDbfs ?? -100;
-  const targetRms = targetFft.rmsDbfs ?? -100;
-  const meterAttack = 1 - Math.exp(-40 * dt);
-  const meterDecay = 1 - Math.exp(-14 * dt);
+  const mAttack = 1 - Math.exp(-40 * dt);
+  const mDecay = 1 - Math.exp(-14 * dt);
+  const tPeakL = targetFft.peakLDbfs ?? targetFft.peakDbfs ?? -100;
+  const tPeakR = targetFft.peakRDbfs ?? targetFft.peakDbfs ?? -100;
+  const tRmsL = targetFft.rmsLDbfs ?? targetFft.rmsDbfs ?? -100;
+  const tRmsR = targetFft.rmsRDbfs ?? targetFft.rmsDbfs ?? -100;
 
-  smoothPeakDbfs +=
-    (targetPeak - smoothPeakDbfs) * (targetPeak > smoothPeakDbfs ? meterAttack : meterDecay);
-  smoothRmsDbfs +=
-    (targetRms - smoothRmsDbfs) * (targetRms > smoothRmsDbfs ? meterAttack : meterDecay);
+  smoothPeakL += (tPeakL - smoothPeakL) * (tPeakL > smoothPeakL ? mAttack : mDecay);
+  smoothPeakR += (tPeakR - smoothPeakR) * (tPeakR > smoothPeakR ? mAttack : mDecay);
+  smoothRmsL += (tRmsL - smoothRmsL) * (tRmsL > smoothRmsL ? mAttack : mDecay);
+  smoothRmsR += (tRmsR - smoothRmsR) * (tRmsR > smoothRmsR ? mAttack : mDecay);
 
-  if (smoothPeakDbfs >= heldPeakDbfs) {
-    heldPeakDbfs = smoothPeakDbfs;
-  } else {
-    heldPeakDbfs = Math.max(smoothPeakDbfs, heldPeakDbfs - 14 * dt);
+  heldPeakL = smoothPeakL >= heldPeakL ? smoothPeakL : Math.max(smoothPeakL, heldPeakL - 14 * dt);
+  heldPeakR = smoothPeakR >= heldPeakR ? smoothPeakR : Math.max(smoothPeakR, heldPeakR - 14 * dt);
+
+  if (targetFft.phaseCorr != null) {
+    hasPhaseData = true;
+    smoothPhase += (targetFft.phaseCorr - smoothPhase) * (1 - Math.exp(-18 * dt));
   }
 
   if (targetFft.cutoffHz && targetFft.activeSeconds >= 2) {
@@ -993,7 +1231,20 @@ function renderLoop(now) {
   }
 
   drawSpectrumFrame(nyquist, smoothLive, smoothMax, peakCaps, smoothCutoffHz);
-  drawLevelMeter(smoothPeakDbfs, smoothRmsDbfs, heldPeakDbfs, targetFft.crestDb ?? null);
+  drawStereoPhaseMeter({
+    peakL: smoothPeakL,
+    peakR: smoothPeakR,
+    rmsL: smoothRmsL,
+    rmsR: smoothRmsR,
+    heldL: heldPeakL,
+    heldR: heldPeakR,
+    truePeak: targetFft.truePeakDbtp ?? Math.max(smoothPeakL, smoothPeakR),
+    crestDb: targetFft.crestDb ?? null,
+    phase: smoothPhase,
+    hasPhase: hasPhaseData,
+    momentaryLufs: targetFft.momentaryLufs ?? null,
+    integratedLufs: targetFft.integratedLufs ?? null,
+  });
   drawWaterfallFrame(nyquist, smoothCutoffHz);
 
   rafId = requestAnimationFrame(renderLoop);
@@ -1017,15 +1268,34 @@ function stopRenderLoop() {
   resetAnimBuffers();
 }
 
+function drawIdleState() {
+  drawSpectrumFrame(24000, null, null, null, null);
+  drawStereoPhaseMeter({
+    peakL: -100,
+    peakR: -100,
+    rmsL: -100,
+    rmsR: -100,
+    heldL: -100,
+    heldR: -100,
+    truePeak: -100,
+    crestDb: null,
+    phase: 0,
+    hasPhase: false,
+    momentaryLufs: null,
+    integratedLufs: null,
+  });
+  drawWaterfallFrame(24000, null);
+}
+
 function ingestFftFrame(fft, isInitialState = false) {
+  if (fullScanResult) return;
+
   if (!fft || !fft.capturing || fft.tabId !== currentTabId) {
     latestSampleRate = null;
     updateButtons(false);
     stopRenderLoop();
     clearWaterfall();
-    drawSpectrumFrame(24000, null, null, null, null);
-    drawLevelMeter(-100, -100, -100, null);
-    drawWaterfallFrame(24000, null);
+    drawIdleState();
     return;
   }
 
@@ -1037,7 +1307,6 @@ function ingestFftFrame(fft, isInitialState = false) {
   }
   lastActiveSeconds = fft.activeSeconds || 0;
 
-  // Accumulate peak energy across all incoming FFT frames between waterfall column shifts
   if (fft.liveBins) {
     if (!wfPendingBins || wfPendingBins.length !== fft.liveBins.length) {
       wfPendingBins = Float32Array.from(fft.liveBins);
@@ -1075,7 +1344,9 @@ function setSpectrumScale(scale) {
   smoothLive = null;
   smoothMax = null;
   peakCaps = null;
-  if (!rafId) {
+  if (fullScanResult) {
+    renderFullScanSnapshot();
+  } else if (!rafId) {
     drawSpectrumFrame(24000, null, null, null, null);
   }
 }
@@ -1122,6 +1393,62 @@ document.getElementById("btnOpenDashboard").addEventListener("click", () => {
   chrome.runtime.sendMessage({ target: "background", type: "OPEN_DASHBOARD" });
 });
 
+document.getElementById("btnScanFull").addEventListener("click", async () => {
+  const fileUrl = getLocalFileUrl();
+  if (!fileUrl || isScanningFull) return;
+
+  const btn = document.getElementById("btnScanFull");
+  const verdictBox = document.getElementById("verdictBox");
+  isScanningFull = true;
+  btn.disabled = true;
+  btn.textContent = "Scanning...";
+  verdictBox.className = "verdict";
+  verdictBox.textContent = "Decoding full track offline (FFT + BS.1770-4 LUFS)...";
+
+  try {
+    if (isCapturingCurrentTab) {
+      await chrome.runtime.sendMessage({ target: "background", type: "STOP_FFT" });
+      updateButtons(false);
+      stopRenderLoop();
+    }
+
+    const resp = await chrome.runtime.sendMessage({
+      target: "background",
+      type: "SCAN_FULL_TRACK",
+      tabId: currentTabId,
+      url: fileUrl,
+      nativeSampleRate: latestLayer1?.nativeSampleRate || 0,
+    });
+
+    if (!resp?.ok) {
+      throw new Error(resp?.error || "Offline scan failed");
+    }
+
+    fullScanResult = resp;
+    latestSampleRate = resp.sampleRate || 48000;
+    document.getElementById("wfPaneTitle").textContent =
+      `Full-Track Spectrogram (0:00 → ${formatDuration(resp.duration)})`;
+    document.getElementById("cutoffVal").textContent = resp.cutoffHz
+      ? `~${(resp.cutoffHz / 1000).toFixed(1)} kHz`
+      : "—";
+    document.getElementById("sampleTimeVal").textContent =
+      `${formatDuration(resp.duration)} (${resp.scanMs}ms)`;
+    document.getElementById("srVal").textContent = `${(resp.sampleRate / 1000).toFixed(1)} kHz`;
+
+    loadFullScanWaterfall(resp.wfCols);
+    renderFullScanSnapshot();
+    evaluateVerdict(resp);
+    updateStatusBar();
+  } catch (err) {
+    verdictBox.className = "verdict fake";
+    verdictBox.textContent = `Full scan failed: ${err?.message || err}`;
+  } finally {
+    isScanningFull = false;
+    btn.disabled = false;
+    btn.textContent = "Scan Full";
+  }
+});
+
 document.getElementById("btnToggleFft").addEventListener("click", async () => {
   if (!currentTabId) return;
 
@@ -1131,9 +1458,7 @@ document.getElementById("btnToggleFft").addEventListener("click", async () => {
     updateButtons(false);
     stopRenderLoop();
     clearWaterfall();
-    drawSpectrumFrame(24000, null, null, null, null);
-    drawLevelMeter(-100, -100, -100, null);
-    drawWaterfallFrame(24000, null);
+    drawIdleState();
     document.getElementById("cutoffVal").textContent = "—";
     document.getElementById("sampleTimeVal").textContent = "0.0s";
     document.getElementById("srVal").textContent = "— kHz";
@@ -1142,6 +1467,10 @@ document.getElementById("btnToggleFft").addEventListener("click", async () => {
     verdictBox.textContent = "FFT & Waterfall analysis stopped.";
     return;
   }
+
+  // Exit full-scan mode and start real-time capture
+  fullScanResult = null;
+  document.getElementById("wfPaneTitle").textContent = "Waterfall Spectrogram (Spek)";
 
   try {
     const streamId = await chrome.tabCapture.getMediaStreamId({
@@ -1170,6 +1499,8 @@ document.getElementById("btnToggleFft").addEventListener("click", async () => {
 });
 
 document.getElementById("btnResetFft").addEventListener("click", () => {
+  fullScanResult = null;
+  document.getElementById("wfPaneTitle").textContent = "Waterfall Spectrogram (Spek)";
   chrome.runtime.sendMessage({ target: "background", type: "RESET_FFT" });
   resetAnimBuffers();
   clearWaterfall();
@@ -1184,14 +1515,13 @@ chrome.runtime.onMessage.addListener((message) => {
 });
 
 async function init() {
-  drawSpectrumFrame(24000, null, null, null, null);
-  drawLevelMeter(-100, -100, -100, null);
-  drawWaterfallFrame(24000, null);
+  drawIdleState();
 
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
   if (!tab?.id) return;
   currentTabId = tab.id;
   currentTabUrl = tab.url || "";
+  updateScanButtonVisibility();
 
   const storageKey = `tab_${tab.id}`;
 

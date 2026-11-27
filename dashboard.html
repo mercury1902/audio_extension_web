@@ -51,6 +51,7 @@
     }
     button:hover { background: #3b3b3b; border-color: #626262; }
     button:active { background: #1e1e1e; }
+    button:disabled { opacity: 0.55; cursor: wait; }
     .btn-primary {
       background: #1a6db8;
       border-color: #368be0;
@@ -70,6 +71,12 @@
       color: #8cc2f2;
     }
     .btn-accent:hover { background: #2b4561; border-color: #5ca0de; }
+    .btn-scan {
+      background: #1a3324;
+      border-color: #35704a;
+      color: #82e0a5;
+    }
+    .btn-scan:hover { background: #224430; border-color: #469662; }
     .btn-sm { padding: 3px 8px; font-size: 11px; }
 
     select.win-select {
@@ -242,6 +249,7 @@
     .pill-muted { background: #331c1c; color: #e87676; border-color: #633131; }
     .pill-codec { background: #1a2633; color: #6bb2ed; border-color: #345270; }
     .pill-direct { background: #1f2b22; color: #82cfa0; border-color: #365941; }
+    .pill-native { background: #1a2f26; color: #7be0b4; border-color: #2e664f; }
     .pill-nonmse { background: #302616; color: #e6b865; border-color: #5e4a26; }
     .pill-probe { background: #2c1e33; color: #cf9be8; border-color: #573a66; }
 
@@ -293,6 +301,7 @@
       flex-wrap: wrap;
     }
     .card-footer-left { display: flex; gap: 5px; }
+    .card-footer-right { display: flex; gap: 5px; }
 
     .empty-grid {
       grid-column: 1 / -1;
@@ -348,6 +357,11 @@
       color: #cf9be8;
       border-color: #573a66;
     }
+    .probe-badge.is-fullscan {
+      background: #1a3324;
+      color: #82e0a5;
+      border-color: #35704a;
+    }
     .probe-name {
       font-size: 12.5px;
       font-weight: 700;
@@ -381,7 +395,7 @@
       gap: 8px;
     }
 
-    /* Dual Charts Side-by-Side (Matched 204px Height) */
+    /* Dual Charts Side-by-Side (Matched 220px Height: 182px + 38px) */
     .dual-charts {
       display: grid;
       grid-template-columns: 1fr 1fr;
@@ -420,14 +434,14 @@
     }
     canvas.probe-meter-canvas {
       width: 100%;
-      height: 22px;
+      height: 38px;
       display: block;
       background: #161616;
       border-top: 1px solid #2c2c2c;
     }
     canvas.probe-wf-canvas {
       width: 100%;
-      height: 204px;
+      height: 220px;
       display: block;
       background: #181818;
       cursor: crosshair;
@@ -499,7 +513,7 @@
   <div class="topbar">
     <div class="brand">
       <h1>Audio Monitor Dashboard</h1>
-      <p>[Audio Bitrate Probe — Multi-Tab MSE/Direct &amp; Spectral Analyzer]</p>
+      <p>[Audio Bitrate Probe — Multi-Tab MSE/Direct, LUFS &amp; Spectral Analyzer]</p>
     </div>
     <div class="actions">
       <label class="toggle">
@@ -538,14 +552,14 @@
     <div id="tabsGrid" class="tabs-grid"></div>
 
     <div class="section-head">
-      <div class="section-title">Multi-Tab Spectral Analyzers (Spectrum + Dynamic Range + Spek Waterfall)</div>
+      <div class="section-title">Multi-Tab Spectral Analyzers (Spectrum + Stereo/Phase/LUFS + Spek Waterfall)</div>
       <div class="section-line"></div>
       <button id="btnStopAllFft" class="btn-danger btn-sm hidden">Stop All</button>
     </div>
 
     <div id="probesEmpty" class="probes-empty">
       No active spectral probes.<br />
-      Click <strong>+ Add FFT Probe</strong> (or <strong>Probe FFT</strong> on any tab panel above) to display both <strong>Spectrum (Lin/Log 31-Band + DR Meter)</strong> and <strong>Waterfall (Spek)</strong> side-by-side for multiple tabs.<br />
+      Click <strong>+ Add FFT Probe</strong> (or <strong>Probe FFT</strong> / <strong>Scan Full</strong> on any tab panel above) to inspect <strong>Spectrum (Lin/Log 31-Band)</strong>, <strong>Stereo L/R + Phase + LUFS</strong>, and <strong>Waterfall (Spek)</strong> side-by-side.<br />
       <span style="font-size:11px; color:#757575;">Tip: In Chrome's picker, choose a tab under <em>Chrome Tab</em> and keep <strong>Share tab audio</strong> enabled.</span>
       <div class="probes-empty-actions">
         <button id="btnAddProbeInline" class="btn-primary">+ Add FFT Probe</button>
@@ -557,7 +571,7 @@
 
   <div class="statusbar">
     <span id="dashStatusLeft">Ready | Audible: 0 | Streams: 0 | FFT Probes: 0</span>
-    <span id="dashStatusRight">FFT 8192-pt | ISO 31-Band RTA | Spek Waterfall</span>
+    <span id="dashStatusRight">FFT 8192-pt | BS.1770-4 LUFS | Stereo Phase | Spek Waterfall</span>
   </div>
 
   <script src="bitrate_chart.js"></script>

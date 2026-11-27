@@ -41,8 +41,9 @@
     .toolbar-left {
       display: flex;
       align-items: center;
-      gap: 7px;
+      gap: 6px;
       min-width: 0;
+      flex-wrap: wrap;
     }
     .app-title {
       font-size: 12px;
@@ -66,6 +67,14 @@
       color: #969696;
       border: 1px solid #383838;
     }
+    .native-tag {
+      padding: 1px 5px;
+      font-size: 10px;
+      font-weight: 700;
+      background: #1a2d1f;
+      color: #67d188;
+      border: 1px solid #2f5e3b;
+    }
 
     /* Native Flat Buttons & Selects */
     button {
@@ -73,7 +82,7 @@
       border: 1px solid #4a4a4a;
       background: #2e2e2e;
       color: #e2e2e2;
-      padding: 3px 10px;
+      padding: 3px 9px;
       font-size: 11px;
       font-weight: 600;
       cursor: pointer;
@@ -81,12 +90,19 @@
     }
     button:hover { background: #3b3b3b; border-color: #606060; }
     button:active { background: #1e1e1e; }
+    button:disabled { opacity: 0.55; cursor: wait; }
     .btn-primary {
       background: #1a6db8;
       border-color: #368be0;
       color: #ffffff;
     }
     .btn-primary:hover { background: #207dd1; border-color: #52a4f5; }
+    .btn-accent {
+      background: #22354a;
+      border-color: #4274a3;
+      color: #8cc2f2;
+    }
+    .btn-accent:hover { background: #2b4561; border-color: #5ca0de; }
     .btn-danger {
       background: #8e2828;
       border-color: #b83b3b;
@@ -253,7 +269,7 @@
       border: 1px solid #2e2e2e;
     }
 
-    /* FFT Spectrum, Level Meter & Waterfall Canvases */
+    /* FFT Spectrum, Stereo/Phase/LUFS Meter & Waterfall Canvases */
     .fft-controls { display: flex; align-items: center; gap: 5px; }
     canvas#fftCanvas {
       width: 100%;
@@ -264,7 +280,7 @@
     }
     canvas#meterCanvas {
       width: 100%;
-      height: 22px;
+      height: 38px;
       display: block;
       background: #161616;
       border: 1px solid #2e2e2e;
@@ -352,6 +368,7 @@
       <span class="app-title">Audio Bitrate Probe</span>
       <span id="codecPill" class="codec-tag">IDLE</span>
       <span id="modePill" class="mode-tag hidden">MSE</span>
+      <span id="nativeSpecPill" class="native-tag hidden"></span>
     </div>
     <button id="btnOpenDashboard" class="btn-ghost" title="Open Multi-Tab Dashboard">Dashboard ↗</button>
   </div>
@@ -394,7 +411,7 @@
       </div>
     </div>
 
-    <!-- Layer 2A: foobar2000-style FFT Spectrum (LIN | LOG 31-Band) + Level/DR Meter -->
+    <!-- Layer 2A: foobar2000-style FFT Spectrum (LIN | LOG 31-Band) + Stereo/Phase/LUFS Meter -->
     <div class="pane">
       <div class="pane-tabbar">
         <span class="pane-tab">Spectrum (FFT + Max-Hold)</span>
@@ -403,20 +420,21 @@
             <button id="btnScaleLin" class="seg-btn active">LIN</button>
             <button id="btnScaleLog" class="seg-btn">LOG</button>
           </div>
+          <button id="btnScanFull" class="btn-accent hidden" title="Offline full-track Spek & Integrated LUFS scan">Scan Full</button>
           <button id="btnResetFft" class="btn-ghost hidden">Reset</button>
           <button id="btnToggleFft" class="btn-primary">Start FFT</button>
         </div>
       </div>
       <div class="pane-body">
         <canvas id="fftCanvas" width="436" height="120"></canvas>
-        <canvas id="meterCanvas" width="436" height="22"></canvas>
+        <canvas id="meterCanvas" width="436" height="38"></canvas>
         <div class="fft-meta-strip">
           <div class="fft-meta-cell">Cutoff: <strong id="cutoffVal">—</strong></div>
           <div class="fft-meta-cell">Time: <strong id="sampleTimeVal">0.0s</strong></div>
           <div class="fft-meta-cell"><strong id="srVal">— kHz</strong></div>
         </div>
         <div id="verdictBox" class="verdict">
-          Click <strong>Start FFT</strong> while audio is playing to inspect spectrum, DR &amp; Spek waterfall.
+          Click <strong>Start FFT</strong> while audio is playing to inspect spectrum, LUFS, Stereo Phase &amp; Spek waterfall.
         </div>
       </div>
     </div>
@@ -424,7 +442,7 @@
     <!-- Layer 2B: Spek / foobar2000-style Waterfall Spectrogram -->
     <div class="pane">
       <div class="pane-tabbar">
-        <span class="pane-tab">Waterfall Spectrogram (Spek)</span>
+        <span class="pane-tab" id="wfPaneTitle">Waterfall Spectrogram (Spek)</span>
         <div class="fft-controls">
           <select id="wfPaletteSelect" class="win-select" title="Waterfall color palette">
             <option value="inferno" selected>Inferno</option>

@@ -1,7 +1,7 @@
 let cachedTabs = [];
 let onlyAudible = false;
 
-// Manage multiple concurrent FFT spectral probes
+// Manage multiple concurrent FFT spectral probes (live local, remote popup, and offline full-scan)
 const probes = new Map(); // probeId -> SpectralProbe
 let sharedAudioCtx = null;
 let nextProbeSeq = 1;
@@ -13,6 +13,7 @@ let lastRenderTs = 0;
 let analysisTimer = null;
 
 const FFT_SIZE = 8192;
+const TIME_FFT_SIZE = 2048;
 const ANALYSIS_MS = 120;
 const DISPLAY_BINS = 112;
 
@@ -21,6 +22,7 @@ const MAX_DB = -15;
 const ATTACK_SPEED = 36;
 const DECAY_SPEED = 14;
 const PEAK_FALL_DB_PER_SEC = 26;
+const ABS_GATE_POWER = Math.pow(10, (-70 + 0.691) / 10);
 
 const ISO_31_BANDS = [
   20, 25, 31.5, 40, 50, 63, 80, 100, 125, 160, 200, 250, 315, 400, 500, 630,
@@ -34,10 +36,24 @@ const LOG_31_LABELS = [
 ];
 
 const WF_WIDTH = 540;
-const WF_HEIGHT = 192;
+const WF_HEIGHT = 204;
 const WF_COLS_PER_SEC = 28;
-const WF_MAX_DB = -24; // Per-bin 8192-pt FFT peak ceiling for bold mid/high contrast
-const WF_GAMMA = 0.72; // Perceptual curve boosting mid-level harmonics without lifting floor
+const WF_MAX_DB = -24;
+const WF_GAMMA = 0.72;
+
+function formatDuration(sec) {
+  const s = Math.max(0, Math.round(sec || 0));
+  const m = Math.floor(s / 60);
+  const rem = s % 60;
+  return `${m}:${String(rem).padStart(2, "0")}`;
+}
+
+function formatDurationPrecise(sec) {
+  const s = Math.max(0, sec || 0);
+  const m = Math.floor(s / 60);
+  const rem = (s - m * 60).toFixed(1).padStart(4, "0");
+  return `${m}:${rem}`;
+}
 
 function buildPaletteLut(stops) {
   const lut = new Uint8Array(256 * 3);
@@ -219,6 +235,63 @@ function percentile(arr, p) {
   return sorted[idx];
 }
 
+function estimateTruePeakAbs(buf) {
+  let peak = 0;
+  const n = buf.length;
+  for (let i = 0; i < n; i++) {
+    const a = buf[i] < 0 ? -buf[i] : buf[i];
+    if (a > peak) peak = a;
+  }
+  if (peak < 0.25 || n < 4) return peak;
+
+  const checkFloor = Math.max(0.25, peak * 0.72);
+  for (let i = 1; i < n - 2; i++) {
+    const y1 = buf[i];
+    const y2 = buf[i + 1];
+    if ((y1 < 0 ? -y1 : y1) < checkFloor && (y2 < 0 ? -y2 : y2) < checkFloor) continue;
+
+    const y0 = buf[i - 1];
+    const y3 = buf[i + 2];
+    const c0 = 2 * y1;
+    const c1 = -y0 + y2;
+    const c2 = 2 * y0 - 5 * y1 + 4 * y2 - y3;
+    const c3 = -y0 + 3 * y1 - 3 * y2 + y3;
+
+    const p25 = Math.abs(0.5 * (c0 + c1 * 0.25 + c2 * 0.0625 + c3 * 0.015625));
+    const p50 = Math.abs(0.5 * (c0 + c1 * 0.5 + c2 * 0.25 + c3 * 0.125));
+    const p75 = Math.abs(0.5 * (c0 + c1 * 0.75 + c2 * 0.5625 + c3 * 0.421875));
+    if (p25 > peak) peak = p25;
+    if (p50 > peak) peak = p50;
+    if (p75 > peak) peak = p75;
+  }
+  return peak;
+}
+
+function computeGatedIntegratedLufs(blocks) {
+  if (!blocks.length) return null;
+  let sumAbs = 0;
+  let countAbs = 0;
+  for (let i = 0; i < blocks.length; i++) {
+    if (blocks[i] > ABS_GATE_POWER) {
+      sumAbs += blocks[i];
+      countAbs += 1;
+    }
+  }
+  if (countAbs === 0) return null;
+
+  const relGatePower = (sumAbs / countAbs) * 0.1;
+  let sumRel = 0;
+  let countRel = 0;
+  for (let i = 0; i < blocks.length; i++) {
+    if (blocks[i] > relGatePower) {
+      sumRel += blocks[i];
+      countRel += 1;
+    }
+  }
+  if (countRel === 0) return null;
+  return -0.691 + 10 * Math.log10(sumRel / countRel);
+}
+
 function detectCutoffHz(holdArr, sr) {
   const binHz = sr / FFT_SIZE;
   const nyquist = sr / 2;
@@ -319,7 +392,7 @@ function updateBottomStatusBar() {
   document.getElementById("dashStatusLeft").textContent =
     `Audible: ${audibleCount} | Streams: ${trackedTabs.length} | FFT Probes: ${probes.size} | Peak: ${topBitrate ? `${topBitrate} kbps` : "—"}`;
   document.getElementById("dashStatusRight").textContent =
-    `FFT ${FFT_SIZE}-pt | ${srText} | ISO 31-Band RTA | Spek Waterfall`;
+    `FFT ${FFT_SIZE}-pt | ${srText} | BS.1770-4 LUFS | Stereo Phase | Spek Waterfall`;
 }
 
 // ---------- SpectralProbe ----------
@@ -329,23 +402,35 @@ class SpectralProbe {
     this.id = options.id;
     this.seq = options.seq || 0;
     this.isRemote = Boolean(options.isRemote);
+    this.isFullScan = Boolean(options.isFullScan);
+    this.fullScanData = options.fullScanData || null;
     this.rawLabel = options.rawLabel || "Tab audio";
     this.linkedTabId = options.linkedTabId ?? null;
     this.spectrumScale = "lin";
 
     this.stream = options.stream || null;
-    this.sourceNode = options.sourceNode || null;
+    this.audioNodes = options.audioNodes || [];
     this.analyser = options.analyser || null;
+    this.analyserL = options.analyserL || null;
+    this.analyserR = options.analyserR || null;
+    this.kAnalyserL = options.kAnalyserL || null;
+    this.kAnalyserR = options.kAnalyserR || null;
     this.sampleRate = options.sampleRate || 48000;
 
     if (this.analyser) {
       const bins = this.analyser.frequencyBinCount;
       this.freqData = new Float32Array(bins);
-      this.timeData = new Float32Array(FFT_SIZE);
+      this.timeDataL = new Float32Array(TIME_FFT_SIZE);
+      this.timeDataR = new Float32Array(TIME_FFT_SIZE);
+      this.kTimeDataL = new Float32Array(TIME_FFT_SIZE);
+      this.kTimeDataR = new Float32Array(TIME_FFT_SIZE);
       this.maxHold = new Float32Array(bins).fill(-140);
     } else {
       this.freqData = null;
-      this.timeData = null;
+      this.timeDataL = null;
+      this.timeDataR = null;
+      this.kTimeDataL = null;
+      this.kTimeDataR = null;
       this.maxHold = null;
     }
 
@@ -357,12 +442,26 @@ class SpectralProbe {
     this.activeSeconds = 0;
     this.drmSilentWarning = false;
 
-    this.rawPeakDbfs = -100;
-    this.rawRmsDbfs = -100;
+    this.rawPeakL = -100;
+    this.rawPeakR = -100;
+    this.rawRmsL = -100;
+    this.rawRmsR = -100;
+    this.truePeakDbtp = -100;
     this.crestDb = null;
-    this.smoothPeakDbfs = -100;
-    this.smoothRmsDbfs = -100;
-    this.heldPeakDbfs = -100;
+    this.phaseCorr = null;
+    this.momentaryLufs = null;
+    this.integratedLufs = null;
+    this.momentaryBlocks = [];
+    this.gatedBlocks = [];
+
+    this.smoothPeakL = -100;
+    this.smoothPeakR = -100;
+    this.smoothRmsL = -100;
+    this.smoothRmsR = -100;
+    this.heldPeakL = -100;
+    this.heldPeakR = -100;
+    this.smoothPhase = 0;
+    this.hasPhase = false;
 
     this.remoteTarget = null;
     this.lastRemoteTs = 0;
@@ -398,6 +497,10 @@ class SpectralProbe {
     this._buildDom();
     this.syncTabLinkOptions();
     this.updateHeaderTitle();
+
+    if (this.isFullScan && this.fullScanData) {
+      this.applyFullScanData(this.fullScanData);
+    }
   }
 
   _buildDom() {
@@ -405,8 +508,12 @@ class SpectralProbe {
     el.className = "probe-card";
     el.dataset.probeId = this.id;
 
-    const badgeText = this.isRemote ? "POPUP" : `#${this.seq}`;
-    const badgeClass = this.isRemote ? "probe-badge is-popup" : "probe-badge";
+    const badgeText = this.isFullScan ? "FULL SCAN" : this.isRemote ? "POPUP" : `#${this.seq}`;
+    const badgeClass = this.isFullScan
+      ? "probe-badge is-fullscan"
+      : this.isRemote
+      ? "probe-badge is-popup"
+      : "probe-badge";
 
     el.innerHTML = `
       <div class="probe-head">
@@ -416,12 +523,12 @@ class SpectralProbe {
         </div>
         <div class="probe-controls">
           ${
-            this.isRemote
+            this.isRemote || this.isFullScan
               ? ""
               : `<select class="probe-link-select js-link-select" title="Link to a tab to display track name & cross-check Layer 1 bitrate"></select>`
           }
-          <button class="btn-ghost btn-sm js-probe-reset">Reset</button>
-          <button class="btn-danger btn-sm js-probe-stop">Stop</button>
+          ${this.isFullScan ? "" : `<button class="btn-ghost btn-sm js-probe-reset">Reset</button>`}
+          <button class="btn-danger btn-sm js-probe-stop">${this.isFullScan ? "Close" : "Stop"}</button>
         </div>
       </div>
 
@@ -436,11 +543,11 @@ class SpectralProbe {
               </div>
             </div>
             <canvas class="probe-canvas js-bar-canvas" width="540" height="182"></canvas>
-            <canvas class="probe-meter-canvas js-meter-canvas" width="540" height="22"></canvas>
+            <canvas class="probe-meter-canvas js-meter-canvas" width="540" height="38"></canvas>
           </div>
           <div class="chart-pane">
             <div class="chart-pane-head">
-              <span>Waterfall Spectrogram (Spek)</span>
+              <span class="js-wf-title">Waterfall Spectrogram (Spek)</span>
               <div class="pane-head-tools">
                 <select class="win-select js-wf-palette" title="Waterfall color palette">
                   <option value="inferno" selected>Inferno</option>
@@ -456,7 +563,7 @@ class SpectralProbe {
                 </select>
               </div>
             </div>
-            <canvas class="probe-wf-canvas js-wf-canvas" width="540" height="204"></canvas>
+            <canvas class="probe-wf-canvas js-wf-canvas" width="540" height="220"></canvas>
           </div>
         </div>
 
@@ -473,6 +580,7 @@ class SpectralProbe {
 
     this.el = el;
     this.nameEl = el.querySelector(".js-probe-name");
+    this.wfTitleEl = el.querySelector(".js-wf-title");
     this.linkSelectEl = el.querySelector(".js-link-select");
     this.btnLin = el.querySelector(".js-scale-lin");
     this.btnLog = el.querySelector(".js-scale-log");
@@ -494,11 +602,13 @@ class SpectralProbe {
     el.querySelector(".js-wf-palette").addEventListener("change", (e) => {
       this.wfPaletteName = e.target.value;
       this.repaintWaterfallFromDbBuffer();
+      if (this.isFullScan) this.renderFullScanStatic();
     });
 
     el.querySelector(".js-wf-floor").addEventListener("change", (e) => {
       this.wfMinDb = Number(e.target.value) || -105;
       this.repaintWaterfallFromDbBuffer();
+      if (this.isFullScan) this.renderFullScanStatic();
     });
 
     this._onWfMouseMove = (e) => {
@@ -514,10 +624,16 @@ class SpectralProbe {
       } else {
         this.wfHover.active = false;
       }
+      if (this.isFullScan) {
+        this.drawWaterfallChart(this.sampleRate / 2);
+      }
     };
 
     this._onWfMouseLeave = () => {
       this.wfHover.active = false;
+      if (this.isFullScan) {
+        this.drawWaterfallChart(this.sampleRate / 2);
+      }
     };
 
     this.wfViewCanvas.addEventListener("mousemove", this._onWfMouseMove);
@@ -534,12 +650,15 @@ class SpectralProbe {
       });
     }
 
-    el.querySelector(".js-probe-reset").addEventListener("click", () => {
-      this.resetAll();
-      if (this.isRemote) {
-        chrome.runtime.sendMessage({ target: "background", type: "RESET_FFT" });
-      }
-    });
+    const resetBtn = el.querySelector(".js-probe-reset");
+    if (resetBtn) {
+      resetBtn.addEventListener("click", () => {
+        this.resetAll();
+        if (this.isRemote) {
+          chrome.runtime.sendMessage({ target: "background", type: "RESET_FFT" });
+        }
+      });
+    }
 
     el.querySelector(".js-probe-stop").addEventListener("click", () => {
       if (this.isRemote) {
@@ -549,6 +668,90 @@ class SpectralProbe {
     });
   }
 
+  applyFullScanData(resp) {
+    this.isFullScan = true;
+    this.fullScanData = resp;
+    this.sampleRate = resp.sampleRate || 48000;
+    this.cutoffHz = resp.cutoffHz ?? null;
+    this.smoothCutoffHz = resp.cutoffHz ?? null;
+    this.isBrickwall = Boolean(resp.isBrickwall);
+    this.activeSeconds = resp.duration || resp.activeSeconds || 0;
+
+    this.smoothPeakL = resp.peakLDbfs ?? -100;
+    this.smoothPeakR = resp.peakRDbfs ?? -100;
+    this.smoothRmsL = resp.rmsLDbfs ?? -100;
+    this.smoothRmsR = resp.rmsRDbfs ?? -100;
+    this.heldPeakL = this.smoothPeakL;
+    this.heldPeakR = this.smoothPeakR;
+    this.truePeakDbtp = resp.truePeakDbtp ?? -100;
+    this.crestDb = resp.crestDb ?? null;
+    this.phaseCorr = resp.phaseCorr ?? null;
+    this.smoothPhase = resp.phaseCorr ?? 0;
+    this.hasPhase = resp.phaseCorr != null;
+    this.momentaryLufs = resp.momentaryLufs ?? null;
+    this.integratedLufs = resp.integratedLufs ?? null;
+
+    this.wfTitleEl.textContent = `Full-Track Spectrogram (0:00 → ${formatDuration(resp.duration)})`;
+    this.loadFullScanWaterfall(resp.wfCols);
+    this.updateTextUi();
+    this.renderFullScanStatic();
+  }
+
+  loadFullScanWaterfall(wfCols) {
+    this.wfDbBuffer.fill(-140);
+    if (!Array.isArray(wfCols) || !wfCols.length) {
+      this.clearWaterfall();
+      return;
+    }
+
+    const numSrcCols = wfCols.length;
+    for (let col = 0; col < WF_WIDTH; col++) {
+      const srcIdx = Math.min(numSrcCols - 1, Math.floor((col / WF_WIDTH) * numSrcCols));
+      const freqArr = wfCols[srcIdx];
+      const srcLen = freqArr.length;
+
+      for (let y = 0; y < WF_HEIGHT; y++) {
+        const freqTop = 1 - y / WF_HEIGHT;
+        const freqBot = 1 - (y + 1) / WF_HEIGHT;
+        const bStart = Math.max(0, Math.floor(freqBot * (srcLen - 1)));
+        const bEnd = Math.min(srcLen - 1, Math.max(bStart, Math.ceil(freqTop * (srcLen - 1))));
+        let maxDb = -140;
+        for (let b = bStart; b <= bEnd; b++) {
+          if (freqArr[b] > maxDb) maxDb = freqArr[b];
+        }
+        this.wfColRaw[y] = maxDb;
+      }
+
+      const colOffset = col * WF_HEIGHT;
+      for (let y = 0; y < WF_HEIGHT; y++) {
+        let db = this.wfColRaw[y];
+        if (y > 0 && this.wfColRaw[y - 1] - 3.5 > db) db = this.wfColRaw[y - 1] - 3.5;
+        if (y < WF_HEIGHT - 1 && this.wfColRaw[y + 1] - 3.5 > db) db = this.wfColRaw[y + 1] - 3.5;
+        this.wfDbBuffer[colOffset + y] = db;
+      }
+    }
+
+    this.wfHasData = true;
+    this.repaintWaterfallFromDbBuffer();
+  }
+
+  renderFullScanStatic() {
+    if (!this.fullScanData) return;
+    const r = this.fullScanData;
+    const nyquist = this.sampleRate / 2;
+    this.smoothLive = Float32Array.from(
+      this.spectrumScale === "log" ? r.logLiveBins : r.liveBins
+    );
+    this.smoothMax = Float32Array.from(
+      this.spectrumScale === "log" ? r.logMaxBins : r.maxBins
+    );
+    this.peakCaps = null;
+
+    this.drawBarsChart(nyquist);
+    this.drawLevelMeter();
+    this.drawWaterfallChart(nyquist);
+  }
+
   setSpectrumScale(scale) {
     this.spectrumScale = scale;
     this.btnLin.classList.toggle("active", scale === "lin");
@@ -556,6 +759,9 @@ class SpectralProbe {
     this.smoothLive = null;
     this.smoothMax = null;
     this.peakCaps = null;
+    if (this.isFullScan) {
+      this.renderFullScanStatic();
+    }
   }
 
   getLinkedTab() {
@@ -597,7 +803,7 @@ class SpectralProbe {
   }
 
   checkTrackChange() {
-    if (this.isRemote || this.linkedTabId == null) return;
+    if (this.isRemote || this.isFullScan || this.linkedTabId == null) return;
     const key = this._getCurrentLinkedTrackKey();
     if (!key) return;
 
@@ -623,7 +829,9 @@ class SpectralProbe {
       this.nameEl.textContent = track;
       this.nameEl.title = `${tab.title}${tab.telemetry?.trackTitle ? ` (${track})` : ""}`;
     } else {
-      this.nameEl.textContent = this.isRemote
+      this.nameEl.textContent = this.isFullScan
+        ? `${this.rawLabel} (Offline Full Scan)`
+        : this.isRemote
         ? `Tab #${this.linkedTabId ?? "?"} (via Popup)`
         : `${this.rawLabel} (Probe #${this.seq})`;
       this.nameEl.title = this.nameEl.textContent;
@@ -734,9 +942,14 @@ class SpectralProbe {
     this.smoothMax = null;
     this.peakCaps = null;
     this.smoothCutoffHz = null;
-    this.smoothPeakDbfs = -100;
-    this.smoothRmsDbfs = -100;
-    this.heldPeakDbfs = -100;
+    this.smoothPeakL = -100;
+    this.smoothPeakR = -100;
+    this.smoothRmsL = -100;
+    this.smoothRmsR = -100;
+    this.heldPeakL = -100;
+    this.heldPeakR = -100;
+    this.smoothPhase = 0;
+    this.hasPhase = false;
   }
 
   resetMaxHoldOnly() {
@@ -750,6 +963,11 @@ class SpectralProbe {
     this.isBrickwall = false;
     this.activeSeconds = 0;
     this.crestDb = null;
+    this.phaseCorr = null;
+    this.momentaryLufs = null;
+    this.integratedLufs = null;
+    this.momentaryBlocks = [];
+    this.gatedBlocks = [];
     this.smoothMax = null;
     this.smoothCutoffHz = null;
   }
@@ -774,9 +992,16 @@ class SpectralProbe {
     this.cutoffHz = payload.cutoffHz ?? null;
     this.isBrickwall = Boolean(payload.isBrickwall);
     this.drmSilentWarning = Boolean(payload.drmSilentWarning);
-    this.rawPeakDbfs = payload.peakDbfs ?? -100;
-    this.rawRmsDbfs = payload.rmsDbfs ?? -100;
+
+    this.rawPeakL = payload.peakLDbfs ?? payload.peakDbfs ?? -100;
+    this.rawPeakR = payload.peakRDbfs ?? payload.peakDbfs ?? -100;
+    this.rawRmsL = payload.rmsLDbfs ?? payload.rmsDbfs ?? -100;
+    this.rawRmsR = payload.rmsRDbfs ?? payload.rmsDbfs ?? -100;
+    this.truePeakDbtp = payload.truePeakDbtp ?? Math.max(this.rawPeakL, this.rawPeakR);
     this.crestDb = payload.crestDb ?? null;
+    this.phaseCorr = payload.phaseCorr ?? null;
+    this.momentaryLufs = payload.momentaryLufs ?? null;
+    this.integratedLufs = payload.integratedLufs ?? null;
 
     if (payload.liveBins) {
       this._accumulateWaterfallBins(payload.liveBins);
@@ -788,35 +1013,92 @@ class SpectralProbe {
     }
   }
 
-  _updateLocalDynamics() {
-    if (!this.timeData) return;
-    let sumSq = 0;
-    let peakAbs = 0;
-    const n = this.timeData.length;
-    for (let i = 0; i < n; i++) {
-      const s = this.timeData[i];
-      const a = s < 0 ? -s : s;
-      if (a > peakAbs) peakAbs = a;
-      sumSq += s * s;
-    }
-    const rms = Math.sqrt(sumSq / n);
-    const peakDbfs = peakAbs > 1e-7 ? 20 * Math.log10(peakAbs) : -140;
-    const rmsDbfs = rms > 1e-7 ? 20 * Math.log10(rms) : -140;
+  _updateLocalStereoAndLoudness() {
+    if (!this.analyserL || !this.analyserR || !this.timeDataL || !this.timeDataR) return;
+    this.analyserL.getFloatTimeDomainData(this.timeDataL);
+    this.analyserR.getFloatTimeDomainData(this.timeDataR);
 
-    this.rawPeakDbfs = peakDbfs;
-    this.rawRmsDbfs = rmsDbfs;
+    const n = this.timeDataL.length;
+    let sumSqL = 0;
+    let sumSqR = 0;
+    let sumLR = 0;
+    let peakL = 0;
+    let peakR = 0;
+
+    for (let i = 0; i < n; i++) {
+      const l = this.timeDataL[i];
+      const r = this.timeDataR[i];
+      const al = l < 0 ? -l : l;
+      const ar = r < 0 ? -r : r;
+      if (al > peakL) peakL = al;
+      if (ar > peakR) peakR = ar;
+      sumSqL += l * l;
+      sumSqR += r * r;
+      sumLR += l * r;
+    }
+
+    const rmsL = Math.sqrt(sumSqL / n);
+    const rmsR = Math.sqrt(sumSqR / n);
+    const peakMono = Math.max(peakL, peakR);
+    const rmsMono = Math.sqrt((sumSqL + sumSqR) / (2 * n));
+    const tpAbs = Math.max(
+      estimateTruePeakAbs(this.timeDataL),
+      estimateTruePeakAbs(this.timeDataR)
+    );
+
+    this.rawPeakL = peakL > 1e-7 ? 20 * Math.log10(peakL) : -140;
+    this.rawPeakR = peakR > 1e-7 ? 20 * Math.log10(peakR) : -140;
+    this.rawRmsL = rmsL > 1e-7 ? 20 * Math.log10(rmsL) : -140;
+    this.rawRmsR = rmsR > 1e-7 ? 20 * Math.log10(rmsR) : -140;
+    this.truePeakDbtp = tpAbs > 1e-7 ? 20 * Math.log10(tpAbs) : -140;
+
+    const peakDbfs = peakMono > 1e-7 ? 20 * Math.log10(peakMono) : -140;
+    const rmsDbfs = rmsMono > 1e-7 ? 20 * Math.log10(rmsMono) : -140;
 
     if (rmsDbfs > -55 && peakDbfs > -50) {
       const instantCrest = Math.max(0, Math.min(35, peakDbfs - rmsDbfs));
-      if (this.crestDb === null) {
-        this.crestDb = instantCrest;
-      } else {
-        this.crestDb += (instantCrest - this.crestDb) * 0.08;
+      this.crestDb =
+        this.crestDb === null ? instantCrest : this.crestDb + (instantCrest - this.crestDb) * 0.08;
+    }
+
+    const denom = Math.sqrt(sumSqL * sumSqR);
+    if (denom > 1e-9 && rmsDbfs > -62) {
+      const corr = Math.max(-1, Math.min(1, sumLR / denom));
+      this.phaseCorr =
+        this.phaseCorr === null ? corr : this.phaseCorr + (corr - this.phaseCorr) * 0.22;
+    }
+
+    if (this.kAnalyserL && this.kAnalyserR && this.kTimeDataL && this.kTimeDataR) {
+      this.kAnalyserL.getFloatTimeDomainData(this.kTimeDataL);
+      this.kAnalyserR.getFloatTimeDomainData(this.kTimeDataR);
+      let kSumL = 0;
+      let kSumR = 0;
+      const kn = this.kTimeDataL.length;
+      for (let i = 0; i < kn; i++) {
+        kSumL += this.kTimeDataL[i] * this.kTimeDataL[i];
+        kSumR += this.kTimeDataR[i] * this.kTimeDataR[i];
+      }
+      const zFrame = kSumL / kn + kSumR / kn;
+      this.momentaryBlocks.push(zFrame);
+      if (this.momentaryBlocks.length > 4) this.momentaryBlocks.shift();
+
+      let momSum = 0;
+      for (let i = 0; i < this.momentaryBlocks.length; i++) momSum += this.momentaryBlocks[i];
+      const z400 = momSum / this.momentaryBlocks.length;
+      if (z400 > 1e-10) {
+        this.momentaryLufs = -0.691 + 10 * Math.log10(z400);
+      }
+
+      if (this.momentaryBlocks.length >= 3) {
+        this.gatedBlocks.push(z400);
+        if (this.gatedBlocks.length > 6000) this.gatedBlocks.shift();
+        this.integratedLufs = computeGatedIntegratedLufs(this.gatedBlocks);
       }
     }
   }
 
   runAnalysisTick() {
+    if (this.isFullScan) return;
     if (this.isRemote) {
       this.updateTextUi();
       return;
@@ -824,10 +1106,7 @@ class SpectralProbe {
     if (!this.analyser || !this.freqData || !this.maxHold) return;
 
     this.analyser.getFloatFrequencyData(this.freqData);
-    if (this.timeData) {
-      this.analyser.getFloatTimeDomainData(this.timeData);
-      this._updateLocalDynamics();
-    }
+    this._updateLocalStereoAndLoudness();
     this.totalFrames += 1;
 
     if (document.hidden) {
@@ -903,6 +1182,8 @@ class SpectralProbe {
   }
 
   renderFrame(dt) {
+    if (this.isFullScan) return;
+
     const wfStepSec = 1 / WF_COLS_PER_SEC;
     let nyquist = this.sampleRate / 2;
 
@@ -957,19 +1238,21 @@ class SpectralProbe {
       this.stepSmoothing(tLive, tMax, dt);
     }
 
-    const meterAttack = 1 - Math.exp(-40 * dt);
-    const meterDecay = 1 - Math.exp(-14 * dt);
-    this.smoothPeakDbfs +=
-      (this.rawPeakDbfs - this.smoothPeakDbfs) *
-      (this.rawPeakDbfs > this.smoothPeakDbfs ? meterAttack : meterDecay);
-    this.smoothRmsDbfs +=
-      (this.rawRmsDbfs - this.smoothRmsDbfs) *
-      (this.rawRmsDbfs > this.smoothRmsDbfs ? meterAttack : meterDecay);
+    const mAttack = 1 - Math.exp(-40 * dt);
+    const mDecay = 1 - Math.exp(-14 * dt);
+    this.smoothPeakL += (this.rawPeakL - this.smoothPeakL) * (this.rawPeakL > this.smoothPeakL ? mAttack : mDecay);
+    this.smoothPeakR += (this.rawPeakR - this.smoothPeakR) * (this.rawPeakR > this.smoothPeakR ? mAttack : mDecay);
+    this.smoothRmsL += (this.rawRmsL - this.smoothRmsL) * (this.rawRmsL > this.smoothRmsL ? mAttack : mDecay);
+    this.smoothRmsR += (this.rawRmsR - this.smoothRmsR) * (this.rawRmsR > this.smoothRmsR ? mAttack : mDecay);
 
-    if (this.smoothPeakDbfs >= this.heldPeakDbfs) {
-      this.heldPeakDbfs = this.smoothPeakDbfs;
-    } else {
-      this.heldPeakDbfs = Math.max(this.smoothPeakDbfs, this.heldPeakDbfs - 14 * dt);
+    this.heldPeakL =
+      this.smoothPeakL >= this.heldPeakL ? this.smoothPeakL : Math.max(this.smoothPeakL, this.heldPeakL - 14 * dt);
+    this.heldPeakR =
+      this.smoothPeakR >= this.heldPeakR ? this.smoothPeakR : Math.max(this.smoothPeakR, this.heldPeakR - 14 * dt);
+
+    if (this.phaseCorr != null) {
+      this.hasPhase = true;
+      this.smoothPhase += (this.phaseCorr - this.smoothPhase) * (1 - Math.exp(-18 * dt));
     }
 
     if (this.cutoffHz && this.activeSeconds >= 2) {
@@ -1096,6 +1379,8 @@ class SpectralProbe {
         { hz: 16000, label: "16k", color: "rgba(214, 147, 45, 0.78)" },
         { hz: 20000, label: "20k", color: "rgba(61, 163, 93, 0.78)" },
         { hz: 22050, label: "22k", color: "rgba(176, 118, 214, 0.72)" },
+        { hz: 32000, label: "32k", color: "rgba(135, 135, 135, 0.45)" },
+        { hz: 40000, label: "40k", color: "rgba(176, 118, 214, 0.65)" },
       ];
 
       ctx.save();
@@ -1103,7 +1388,7 @@ class SpectralProbe {
       ctx.font = "10.5px Segoe UI, Tahoma, sans-serif";
       ctx.textAlign = "left";
       for (const m of markers) {
-        if (m.hz >= nyquist) continue;
+        if (m.hz >= nyquist - 400) continue;
         const x = Math.round((m.hz / nyquist) * plotW) + 0.5;
         ctx.strokeStyle = m.color;
         ctx.beginPath();
@@ -1122,7 +1407,7 @@ class SpectralProbe {
       ctx.fillText(`${(nyquist / 1000).toFixed(0)}k`, plotW - 22, h - 4);
 
       if (this.smoothCutoffHz) {
-        const cx = Math.round((this.smoothCutoffHz / nyquist) * plotW) + 0.5;
+        const cx = Math.round((Math.min(this.smoothCutoffHz, nyquist) / nyquist) * plotW) + 0.5;
         ctx.strokeStyle = "#3399ff";
         ctx.lineWidth = 1.6;
         ctx.beginPath();
@@ -1135,54 +1420,107 @@ class SpectralProbe {
 
   drawLevelMeter() {
     const ctx = this.meterCtx;
-    const { w, h } = syncCanvasDpr(this.meterCanvas, ctx, 540, 22);
+    const { w, h } = syncCanvasDpr(this.meterCanvas, ctx, 540, 38);
     ctx.clearRect(0, 0, w, h);
     ctx.fillStyle = "#161616";
     ctx.fillRect(0, 0, w, h);
 
-    const labelPadRight = 198;
-    const barW = Math.max(40, w - labelPadRight - 8);
-    const barX = 4;
-    const barY = 5;
-    const barH = h - 10;
-
-    ctx.fillStyle = "#101010";
-    ctx.fillRect(barX, barY, barW, barH);
-    ctx.strokeStyle = "#2c2c2c";
-    ctx.strokeRect(barX + 0.5, barY + 0.5, barW - 1, barH - 1);
+    const labelPadRight = 212;
+    const chLabelW = 14;
+    const barX = chLabelW + 5;
+    const barW = Math.max(60, w - labelPadRight - barX - 8);
 
     const dbToX = (db) => {
       const clamped = Math.max(-60, Math.min(0, db));
       return barX + ((clamped + 60) / 60) * barW;
     };
 
-    if (this.smoothPeakDbfs > -60) {
-      const px = dbToX(this.smoothPeakDbfs);
-      ctx.fillStyle = "rgba(82, 148, 207, 0.32)";
-      ctx.fillRect(barX, barY, Math.max(0, px - barX), barH);
+    const drawChannelBar = (label, y, barH, peakDb, rmsDb, heldDb) => {
+      ctx.font = "bold 9px Segoe UI, Tahoma, sans-serif";
+      ctx.textAlign = "left";
+      ctx.textBaseline = "middle";
+      ctx.fillStyle = "#8a8a8a";
+      ctx.fillText(label, 5, y + barH / 2 + 0.5);
+
+      ctx.fillStyle = "#101010";
+      ctx.fillRect(barX, y, barW, barH);
+      ctx.strokeStyle = "#2c2c2c";
+      ctx.strokeRect(barX + 0.5, y + 0.5, barW - 1, barH - 1);
+
+      if (peakDb > -60) {
+        const px = dbToX(peakDb);
+        ctx.fillStyle = "rgba(82, 148, 207, 0.34)";
+        ctx.fillRect(barX + 1, y + 1, Math.max(0, px - barX - 1), barH - 2);
+      }
+      if (rmsDb > -60) {
+        const rx = dbToX(rmsDb);
+        ctx.fillStyle = rmsDb > -6 ? "#d6932d" : "#5294cf";
+        ctx.fillRect(barX + 1, y + 1, Math.max(0, rx - barX - 1), barH - 2);
+      }
+      if (heldDb > -60) {
+        const hx = Math.round(dbToX(heldDb));
+        ctx.fillStyle = heldDb > -0.3 ? "#cf4646" : "#e6eef5";
+        ctx.fillRect(hx - 1, y + 1, 2, barH - 2);
+      }
+    };
+
+    drawChannelBar("L", 4, 8, this.smoothPeakL, this.smoothRmsL, this.heldPeakL);
+    drawChannelBar("R", 14, 8, this.smoothPeakR, this.smoothRmsR, this.heldPeakR);
+
+    // Phase Correlation bar (-1 to +1)
+    const phY = 26;
+    const phH = 8;
+    ctx.font = "bold 9px Segoe UI, Tahoma, sans-serif";
+    ctx.textAlign = "left";
+    ctx.textBaseline = "middle";
+    ctx.fillStyle = "#8a8a8a";
+    ctx.fillText("Φ", 5, phY + phH / 2 + 0.5);
+
+    ctx.fillStyle = "#101010";
+    ctx.fillRect(barX, phY, barW, phH);
+    ctx.strokeStyle = "#2c2c2c";
+    ctx.strokeRect(barX + 0.5, phY + 0.5, barW - 1, phH - 1);
+
+    const midX = barX + barW / 2;
+    ctx.strokeStyle = "#3a3a3a";
+    ctx.beginPath();
+    ctx.moveTo(Math.round(midX) + 0.5, phY + 1);
+    ctx.lineTo(Math.round(midX) + 0.5, phY + phH - 1);
+    ctx.stroke();
+
+    if (this.hasPhase) {
+      const clampedPh = Math.max(-1, Math.min(1, this.smoothPhase));
+      const phX = midX + clampedPh * (barW / 2 - 2);
+      const phColor = clampedPh < 0 ? "#cf4646" : clampedPh < 0.3 ? "#d6932d" : "#3da35d";
+
+      ctx.fillStyle = phColor;
+      if (clampedPh >= 0) {
+        ctx.fillRect(midX, phY + 2, Math.max(1, phX - midX), phH - 4);
+      } else {
+        ctx.fillRect(phX, phY + 2, Math.max(1, midX - phX), phH - 4);
+      }
+      ctx.fillStyle = "#ffffff";
+      ctx.fillRect(Math.round(phX) - 1, phY + 1, 2, phH - 2);
     }
 
-    if (this.smoothRmsDbfs > -60) {
-      const rx = dbToX(this.smoothRmsDbfs);
-      ctx.fillStyle = this.smoothRmsDbfs > -6 ? "#d6932d" : "#5294cf";
-      ctx.fillRect(barX, barY, Math.max(0, rx - barX), barH);
-    }
-
-    if (this.heldPeakDbfs > -60) {
-      const hx = Math.round(dbToX(this.heldPeakDbfs));
-      ctx.fillStyle = this.heldPeakDbfs > -0.5 ? "#cf4646" : "#e6eef5";
-      ctx.fillRect(hx - 1, barY, 2, barH);
-    }
-
-    const peakStr = this.smoothPeakDbfs > -90 ? `${this.smoothPeakDbfs.toFixed(1)}` : "-∞";
-    const rmsStr = this.smoothRmsDbfs > -90 ? `${this.smoothRmsDbfs.toFixed(1)}` : "-∞";
-    const drStr = this.crestDb != null ? `${this.crestDb.toFixed(1)}dB` : "—";
+    // Right-side 2-line broadcast readout
+    const tpStr = this.truePeakDbtp > -90 ? `${this.truePeakDbtp.toFixed(1)}` : "-∞";
+    const drStr = this.crestDb != null ? `${this.crestDb.toFixed(1)}` : "—";
+    const hasInt = this.integratedLufs != null;
+    const lufsVal = hasInt ? this.integratedLufs : this.momentaryLufs;
+    const lufsTag = hasInt ? "I" : "M";
+    const lufsStr = lufsVal != null ? `${lufsTag} ${lufsVal.toFixed(1)} LUFS` : "LUFS —";
+    const phStr = this.hasPhase
+      ? `${this.smoothPhase >= 0 ? "+" : ""}${this.smoothPhase.toFixed(2)}`
+      : "—";
 
     ctx.font = "10px Segoe UI, Tahoma, sans-serif";
     ctx.textAlign = "right";
     ctx.textBaseline = "middle";
-    ctx.fillStyle = "#a8a8a8";
-    ctx.fillText(`Pk ${peakStr} | RMS ${rmsStr} | DR ${drStr}`, w - 6, h / 2);
+    ctx.fillStyle = this.truePeakDbtp > -0.2 ? "#f29696" : "#b8b8b8";
+    ctx.fillText(`TP ${tpStr} dBTP | DR ${drStr} dB`, w - 6, 11);
+    ctx.fillStyle = "#96c7f2";
+    ctx.fillText(`${lufsStr} | Φ ${phStr}`, w - 6, 27);
   }
 
   _getWaterfallLayout(w, h) {
@@ -1197,9 +1535,10 @@ class SpectralProbe {
 
   drawWaterfallChart(nyquist) {
     const ctx = this.wfViewCtx;
-    const { w, h } = syncCanvasDpr(this.wfViewCanvas, ctx, 540, 204);
+    const { w, h } = syncCanvasDpr(this.wfViewCanvas, ctx, 540, 220);
     const { padLeft, padTop, plotW, plotH } = this._getWaterfallLayout(w, h);
-    const totalSec = WF_WIDTH / WF_COLS_PER_SEC;
+    const isFull = this.isFullScan && this.fullScanData;
+    const totalSec = isFull ? this.fullScanData.duration : WF_WIDTH / WF_COLS_PER_SEC;
 
     ctx.clearRect(0, 0, w, h);
     ctx.fillStyle = "#181818";
@@ -1214,33 +1553,60 @@ class SpectralProbe {
     ctx.lineWidth = 1;
     ctx.strokeRect(padLeft + 0.5, padTop + 0.5, plotW - 1, plotH - 1);
 
-    // Bottom Time Axis ticks & subtle vertical grid (-18s -> 0s)
+    // Bottom Time Axis ticks & subtle vertical grid
     ctx.save();
     ctx.font = "9.5px Segoe UI, Tahoma, sans-serif";
     ctx.textBaseline = "alphabetic";
-    const stepSec = 3;
-    for (let s = 0; s <= Math.floor(totalSec); s += stepSec) {
-      const x = Math.round(padLeft + plotW - (s / totalSec) * plotW) + 0.5;
-      if (x < padLeft + 10) continue;
+    if (isFull && totalSec > 0) {
+      const tickCount = 6;
+      for (let i = 0; i <= tickCount; i++) {
+        const frac = i / tickCount;
+        const x = Math.round(padLeft + frac * plotW) + 0.5;
+        const sec = frac * totalSec;
 
-      if (s > 0 && this.wfHasData) {
-        ctx.strokeStyle = "rgba(255, 255, 255, 0.08)";
+        if (i > 0 && i < tickCount && this.wfHasData) {
+          ctx.strokeStyle = "rgba(255, 255, 255, 0.08)";
+          ctx.beginPath();
+          ctx.moveTo(x, padTop + 1);
+          ctx.lineTo(x, padTop + plotH - 1);
+          ctx.stroke();
+        }
+
+        ctx.strokeStyle = "#555555";
         ctx.beginPath();
-        ctx.moveTo(x, padTop + 1);
-        ctx.lineTo(x, padTop + plotH - 1);
+        ctx.moveTo(x, padTop + plotH);
+        ctx.lineTo(x, padTop + plotH + 3);
         ctx.stroke();
+
+        ctx.fillStyle = "#7a7a7a";
+        ctx.textAlign = i === 0 ? "left" : i === tickCount ? "right" : "center";
+        ctx.fillText(formatDuration(sec), x, h - 3);
       }
+    } else {
+      const stepSec = 3;
+      for (let s = 0; s <= Math.floor(totalSec); s += stepSec) {
+        const x = Math.round(padLeft + plotW - (s / totalSec) * plotW) + 0.5;
+        if (x < padLeft + 10) continue;
 
-      ctx.strokeStyle = "#555555";
-      ctx.beginPath();
-      ctx.moveTo(x, padTop + plotH);
-      ctx.lineTo(x, padTop + plotH + 3);
-      ctx.stroke();
+        if (s > 0 && this.wfHasData) {
+          ctx.strokeStyle = "rgba(255, 255, 255, 0.08)";
+          ctx.beginPath();
+          ctx.moveTo(x, padTop + 1);
+          ctx.lineTo(x, padTop + plotH - 1);
+          ctx.stroke();
+        }
 
-      ctx.fillStyle = "#7a7a7a";
-      ctx.textAlign = s === 0 ? "right" : "center";
-      const lbl = s === 0 ? "0s" : `-${s}s`;
-      ctx.fillText(lbl, s === 0 ? padLeft + plotW : x, h - 3);
+        ctx.strokeStyle = "#555555";
+        ctx.beginPath();
+        ctx.moveTo(x, padTop + plotH);
+        ctx.lineTo(x, padTop + plotH + 3);
+        ctx.stroke();
+
+        ctx.fillStyle = "#7a7a7a";
+        ctx.textAlign = s === 0 ? "right" : "center";
+        const lbl = s === 0 ? "0s" : `-${s}s`;
+        ctx.fillText(lbl, s === 0 ? padLeft + plotW : x, h - 3);
+      }
     }
     ctx.restore();
 
@@ -1251,6 +1617,8 @@ class SpectralProbe {
       { hz: 16000, label: "16k", color: "rgba(214, 147, 45, 0.65)", text: "#d6932d" },
       { hz: 20000, label: "20k", color: "rgba(61, 163, 93, 0.72)", text: "#5cc47b" },
       { hz: 22050, label: "22k", color: "rgba(176, 118, 214, 0.58)", text: "#c494e6" },
+      { hz: 32000, label: "32k", color: "rgba(160, 160, 160, 0.28)", text: "#969696" },
+      { hz: 40000, label: "40k", color: "rgba(176, 118, 214, 0.58)", text: "#c494e6" },
     ];
 
     ctx.save();
@@ -1348,8 +1716,14 @@ class SpectralProbe {
       const freqHz = (1 - this.wfHover.normY) * nyquist;
       const freqStr =
         freqHz >= 1000 ? `${(freqHz / 1000).toFixed(2)} kHz` : `${Math.round(freqHz)} Hz`;
-      const timeAgo = (1 - this.wfHover.normX) * totalSec;
-      const timeStr = timeAgo < 0.05 ? "0.0s" : `-${timeAgo.toFixed(1)}s`;
+
+      let timeStr = "";
+      if (isFull) {
+        timeStr = formatDurationPrecise(this.wfHover.normX * totalSec);
+      } else {
+        const timeAgo = (1 - this.wfHover.normX) * totalSec;
+        timeStr = timeAgo < 0.05 ? "0.0s" : `-${timeAgo.toFixed(1)}s`;
+      }
 
       const col = Math.max(0, Math.min(WF_WIDTH - 1, Math.floor(this.wfHover.normX * WF_WIDTH)));
       const row = Math.max(0, Math.min(WF_HEIGHT - 1, Math.floor(this.wfHover.normY * WF_HEIGHT)));
@@ -1387,7 +1761,10 @@ class SpectralProbe {
     this.cutoffEl.textContent = this.cutoffHz
       ? `~${(this.cutoffHz / 1000).toFixed(1)} kHz`
       : "Measuring...";
-    this.sampleTimeEl.textContent = `${this.activeSeconds.toFixed(1)}s`;
+    this.sampleTimeEl.textContent =
+      this.isFullScan && this.fullScanData
+        ? `${formatDuration(this.fullScanData.duration)} (${this.fullScanData.scanMs}ms)`
+        : `${this.activeSeconds.toFixed(1)}s`;
     this.srEl.textContent = `${(this.sampleRate / 1000).toFixed(1)} kHz`;
 
     const linkedTab = this.getLinkedTab();
@@ -1395,7 +1772,10 @@ class SpectralProbe {
     const reportedKbps = linkedTab?.telemetry?.avgKbps || 0;
     if (linkedTab?.telemetry) {
       const ratePart = reportedKbps > 0 ? ` ${reportedKbps} kbps` : " LIVE";
-      this.bitrateRefEl.innerHTML = `Layer 1: <strong>${esc(layer1Codec.toUpperCase())}${ratePart}</strong>`;
+      const bitsPart = linkedTab.telemetry.nativeBitDepth
+        ? ` (${linkedTab.telemetry.nativeBitDepth}-bit)`
+        : "";
+      this.bitrateRefEl.innerHTML = `Layer 1: <strong>${esc(layer1Codec.toUpperCase())}${ratePart}${bitsPart}</strong>`;
     } else if (linkedTab) {
       this.bitrateRefEl.innerHTML = `Layer 1: <strong>Unmeasured</strong>`;
     } else {
@@ -1410,14 +1790,19 @@ class SpectralProbe {
       return;
     }
 
-    if (this.activeSeconds < 4.5 || !this.cutoffHz) {
+    if (!this.isFullScan && (this.activeSeconds < 4.5 || !this.cutoffHz)) {
       box.className = "verdict";
       box.textContent = `Accumulating Max-Hold peaks (${this.activeSeconds.toFixed(1)}s / ~5s) — waiting for transients...`;
       return;
     }
 
-    const khz = (this.cutoffHz / 1000).toFixed(1);
+    const khz = this.cutoffHz ? (this.cutoffHz / 1000).toFixed(1) : "—";
     const drPart = this.crestDb != null ? `DR ${this.crestDb.toFixed(1)} dB` : "DR —";
+    const lufsVal = this.integratedLufs ?? this.momentaryLufs;
+    const lufsPart = lufsVal != null ? ` | ${lufsVal.toFixed(1)} LUFS` : "";
+    const tpPart =
+      this.truePeakDbtp > -90 ? ` | TP ${this.truePeakDbtp.toFixed(1)} dBTP` : "";
+
     const layer1Lossy =
       isKnownLossyCodec(layer1Codec) ||
       (reportedKbps > 0 && reportedKbps < 500 && !isKnownLosslessCodec(layer1Codec));
@@ -1439,7 +1824,7 @@ class SpectralProbe {
     } else {
       box.className = "verdict fake";
     }
-    box.textContent = `~${khz} kHz | ${drPart}`;
+    box.textContent = `~${khz} kHz | ${drPart}${lufsPart}${tpPart}`;
   }
 
   destroy() {
@@ -1447,18 +1832,23 @@ class SpectralProbe {
       this.wfViewCanvas.removeEventListener("mousemove", this._onWfMouseMove);
       this.wfViewCanvas.removeEventListener("mouseleave", this._onWfMouseLeave);
     }
-    try {
-      if (this.sourceNode) this.sourceNode.disconnect();
-      if (this.analyser) this.analyser.disconnect();
-    } catch {
-      // Ignore disconnect errors if already disconnected
+    for (const node of this.audioNodes) {
+      try {
+        node.disconnect();
+      } catch {
+        // Ignore
+      }
     }
+    this.audioNodes = [];
     if (this.stream) {
       this.stream.getTracks().forEach((t) => t.stop());
       this.stream = null;
     }
-    this.sourceNode = null;
     this.analyser = null;
+    this.analyserL = null;
+    this.analyserR = null;
+    this.kAnalyserL = null;
+    this.kAnalyserR = null;
     if (this.el && this.el.parentNode) {
       this.el.remove();
     }
@@ -1475,11 +1865,21 @@ function updateProbesLayoutState() {
   updateBottomStatusBar();
 }
 
+function hasLiveProbes() {
+  for (const probe of probes.values()) {
+    if (!probe.isFullScan) return true;
+  }
+  return false;
+}
+
 function startUnifiedLoops() {
+  if (!hasLiveProbes()) return;
+
   if (!analysisTimer) {
     analysisTimer = setInterval(() => {
       const now = performance.now();
       for (const [id, probe] of probes.entries()) {
+        if (probe.isFullScan) continue;
         if (probe.isRemote && probe.lastRemoteTs && now - probe.lastRemoteTs > 1800) {
           removeProbe(id);
           continue;
@@ -1496,7 +1896,7 @@ function startUnifiedLoops() {
 }
 
 function stopUnifiedLoopsIfEmpty() {
-  if (probes.size > 0) return;
+  if (hasLiveProbes()) return;
 
   if (rafId) {
     cancelAnimationFrame(rafId);
@@ -1514,7 +1914,7 @@ function stopUnifiedLoopsIfEmpty() {
 }
 
 function unifiedRenderLoop(now) {
-  if (probes.size === 0) {
+  if (!hasLiveProbes()) {
     rafId = null;
     return;
   }
@@ -1523,7 +1923,9 @@ function unifiedRenderLoop(now) {
   lastRenderTs = now;
 
   for (const probe of probes.values()) {
-    probe.renderFrame(dt);
+    if (!probe.isFullScan) {
+      probe.renderFrame(dt);
+    }
   }
 
   rafId = requestAnimationFrame(unifiedRenderLoop);
@@ -1601,8 +2003,40 @@ async function addTabForFft(preLinkTabId = null) {
     const analyser = sharedAudioCtx.createAnalyser();
     analyser.fftSize = FFT_SIZE;
     analyser.smoothingTimeConstant = 0.0;
-
     sourceNode.connect(analyser);
+
+    // Stereo L/R splitter
+    const splitter = sharedAudioCtx.createChannelSplitter(2);
+    const analyserL = sharedAudioCtx.createAnalyser();
+    const analyserR = sharedAudioCtx.createAnalyser();
+    analyserL.fftSize = TIME_FFT_SIZE;
+    analyserR.fftSize = TIME_FFT_SIZE;
+    sourceNode.connect(splitter);
+    splitter.connect(analyserL, 0);
+    splitter.connect(analyserR, 1);
+
+    // ITU-R BS.1770-4 K-Weighting chain
+    const kShelf = sharedAudioCtx.createBiquadFilter();
+    kShelf.type = "highshelf";
+    kShelf.frequency.value = 1681.974;
+    kShelf.gain.value = 3.9998;
+
+    const kHighpass = sharedAudioCtx.createBiquadFilter();
+    kHighpass.type = "highpass";
+    kHighpass.frequency.value = 38.135;
+    kHighpass.Q.value = 0.5003;
+
+    const kSplitter = sharedAudioCtx.createChannelSplitter(2);
+    const kAnalyserL = sharedAudioCtx.createAnalyser();
+    const kAnalyserR = sharedAudioCtx.createAnalyser();
+    kAnalyserL.fftSize = TIME_FFT_SIZE;
+    kAnalyserR.fftSize = TIME_FFT_SIZE;
+
+    sourceNode.connect(kShelf);
+    kShelf.connect(kHighpass);
+    kHighpass.connect(kSplitter);
+    kSplitter.connect(kAnalyserL, 0);
+    kSplitter.connect(kAnalyserR, 1);
 
     const seq = nextProbeSeq++;
     const probeId = `local_${seq}`;
@@ -1615,8 +2049,23 @@ async function addTabForFft(preLinkTabId = null) {
       rawLabel: audioTracks[0].label || "Tab audio",
       linkedTabId,
       stream,
-      sourceNode,
+      audioNodes: [
+        sourceNode,
+        analyser,
+        splitter,
+        analyserL,
+        analyserR,
+        kShelf,
+        kHighpass,
+        kSplitter,
+        kAnalyserL,
+        kAnalyserR,
+      ],
       analyser,
+      analyserL,
+      analyserR,
+      kAnalyserL,
+      kAnalyserR,
       sampleRate: sharedAudioCtx.sampleRate,
     });
 
@@ -1637,6 +2086,64 @@ async function addTabForFft(preLinkTabId = null) {
     pendingLinkTabId = null;
     if (err?.name !== "AbortError" && err?.name !== "NotAllowedError") {
       alert(`Failed to capture tab audio: ${err?.message || err}`);
+    }
+  }
+}
+
+async function runFullTrackScanForTab(tabId, btnEl) {
+  const tab = cachedTabs.find((t) => t.tabId === tabId);
+  if (!tab) return;
+  const fileUrl =
+    tab.telemetry?.srcUrl && tab.telemetry.srcUrl.startsWith("file://")
+      ? tab.telemetry.srcUrl
+      : tab.url && tab.url.startsWith("file://")
+      ? tab.url
+      : "";
+  if (!fileUrl) return;
+
+  if (btnEl) {
+    btnEl.disabled = true;
+    btnEl.textContent = "Scanning...";
+  }
+
+  try {
+    const resp = await chrome.runtime.sendMessage({
+      target: "background",
+      type: "SCAN_FULL_TRACK",
+      tabId,
+      url: fileUrl,
+      nativeSampleRate: tab.telemetry?.nativeSampleRate || 0,
+    });
+
+    if (!resp?.ok) {
+      throw new Error(resp?.error || "Full-track scan failed");
+    }
+
+    const probeId = `fullscan_${tabId}`;
+    let probe = probes.get(probeId);
+    if (!probe) {
+      probe = new SpectralProbe({
+        id: probeId,
+        isFullScan: true,
+        linkedTabId: tabId,
+        rawLabel: tab.title,
+        sampleRate: resp.sampleRate || 48000,
+        fullScanData: resp,
+      });
+      probes.set(probeId, probe);
+      document.getElementById("probesStack").prepend(probe.el);
+      updateProbesLayoutState();
+    } else {
+      probe.applyFullScanData(resp);
+    }
+
+    probe.el.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  } catch (err) {
+    alert(`Full scan failed: ${err?.message || err}`);
+  } finally {
+    if (btnEl) {
+      btnEl.disabled = false;
+      btnEl.textContent = "Scan Full";
     }
   }
 }
@@ -1698,7 +2205,7 @@ function createTabCard(tabId) {
       <div class="metrics-row js-nonmse-wrap hidden">
         <div class="js-nonmse-msg" style="font-size:11.5px; color:#969696; line-height:1.45;">
           Audio via WebAudio / WebRTC / unmeasured stream.<br/>
-          Click <strong>Probe FFT</strong> to inspect its real-time spectrum &amp; DR.
+          Click <strong>Probe FFT</strong> to inspect its real-time spectrum &amp; LUFS.
         </div>
       </div>
     </div>
@@ -1708,7 +2215,10 @@ function createTabCard(tabId) {
         <button class="btn-ghost btn-sm" data-action="focus" data-tab="${tabId}">Go to tab</button>
         <button class="btn-ghost btn-sm js-mute-btn" data-action="mute" data-tab="${tabId}">Mute</button>
       </div>
-      <button class="btn-accent btn-sm js-probe-btn" data-action="probe" data-tab="${tabId}">Probe FFT</button>
+      <div class="card-footer-right">
+        <button class="btn-scan btn-sm js-scan-btn hidden" data-action="scan" data-tab="${tabId}">Scan Full</button>
+        <button class="btn-accent btn-sm js-probe-btn" data-action="probe" data-tab="${tabId}">Probe FFT</button>
+      </div>
     </div>
   `;
 
@@ -1736,6 +2246,7 @@ function createTabCard(tabId) {
     peakEl: el.querySelector(".js-peak"),
     mimeEl: el.querySelector(".js-mime"),
     muteBtn: el.querySelector(".js-mute-btn"),
+    scanBtn: el.querySelector(".js-scan-btn"),
     probeBtn: el.querySelector(".js-probe-btn"),
   };
 }
@@ -1798,6 +2309,9 @@ function renderTabs(tabs) {
       ? `${t.trackTitle}${t.trackArtist ? ` — ${t.trackArtist}` : ""}`
       : host;
     const probed = isTabBeingProbed(item.tabId);
+    const isLocalFile =
+      (item.url && item.url.startsWith("file://")) ||
+      (t?.srcUrl && t.srcUrl.startsWith("file://"));
 
     entry.el.className = `tab-card ${item.audible ? "is-live" : "is-paused"}`;
 
@@ -1824,10 +2338,22 @@ function renderTabs(tabs) {
       t && t.streamMode && t.streamMode !== "MSE"
         ? `<span class="pill pill-direct">${esc(t.streamMode.toUpperCase())}</span>`
         : "";
+    const nativeSpec =
+      t && (t.nativeBitDepth || t.nativeSampleRate)
+        ? `<span class="pill pill-native" title="${esc(t.nativeMd5 ? `MD5: ${t.nativeMd5}` : "Native File Header")}">${esc(
+            [
+              t.nativeBitDepth ? `${t.nativeBitDepth}-bit` : "",
+              t.nativeSampleRate ? `${(t.nativeSampleRate / 1000).toFixed(1)} kHz` : "",
+            ]
+              .filter(Boolean)
+              .join(" / ")
+          )}</span>`
+        : "";
     const probeBadge = probed ? `<span class="pill pill-probe">PROBING FFT</span>` : "";
-    entry.badgesEl.innerHTML = `${statusBadge}${muteBadge}${codecBadge}${modeBadge}${probeBadge}`;
+    entry.badgesEl.innerHTML = `${statusBadge}${muteBadge}${codecBadge}${modeBadge}${nativeSpec}${probeBadge}`;
 
     entry.muteBtn.textContent = item.muted ? "Unmute" : "Mute";
+    entry.scanBtn.classList.toggle("hidden", !isLocalFile);
     entry.probeBtn.textContent = probed ? "+ Probe Again" : "Probe FFT";
 
     if (t) {
@@ -1844,7 +2370,7 @@ function renderTabs(tabs) {
           ? `${(t.lastChunkBytes / 1024).toFixed(1)} KB / ${t.lastDeltaSec}s (#${t.chunkCount})`
           : `${t.lastDeltaSec}s (#${t.chunkCount})`;
       entry.mimeEl.textContent = `${t.mimeType} | ${sizePart}`;
-      entry.mimeEl.title = t.mimeType;
+      entry.mimeEl.title = t.nativeMd5 ? `${t.mimeType} | MD5 ${t.nativeMd5}` : t.mimeType;
 
       entry.chart.update(t);
     } else {
@@ -1855,7 +2381,7 @@ function renderTabs(tabs) {
           `Local file (<code>file://</code>). Enable <strong>Allow access to file URLs</strong> in <code>chrome://extensions</code> → <strong>Details</strong>, then press <strong>F5</strong>.`;
       } else {
         entry.nonMseMsg.innerHTML =
-          `Audio via WebAudio / WebRTC / unmeasured stream.<br/>Click <strong>Probe FFT</strong> to inspect its real-time spectrum &amp; DR.`;
+          `Audio via WebAudio / WebRTC / unmeasured stream.<br/>Click <strong>Probe FFT</strong> to inspect its real-time spectrum &amp; LUFS.`;
       }
     }
 
@@ -1901,11 +2427,16 @@ document.getElementById("tabsGrid").addEventListener("click", (e) => {
     chrome.runtime.sendMessage({ target: "background", type: "TOGGLE_MUTE_TAB", tabId });
   } else if (action === "probe") {
     addTabForFft(tabId);
+  } else if (action === "scan") {
+    runFullTrackScanForTab(tabId, btn);
   }
 });
 
 window.addEventListener("resize", () => {
   tabCardMap.forEach((entry) => entry.chart.resize());
+  for (const probe of probes.values()) {
+    if (probe.isFullScan) probe.renderFullScanStatic();
+  }
 });
 
 chrome.storage.onChanged.addListener((changes, area) => {
