@@ -299,32 +299,41 @@ function detectCutoffHz(holdArr, sr) {
   const midStart = Math.floor(2000 / binHz);
   const midEnd = Math.min(holdArr.length - 1, Math.floor(8000 / binHz));
   const midVals = [];
-  for (let i = midStart; i <= midEnd; i++) midVals.push(holdArr[i]);
+  for (let i = midStart; i <= midEnd; i++) {
+    midVals.push(holdArr[i]);
+  }
   const refDb = percentile(midVals, 0.8);
   if (refDb < -72) return { cutoffHz: null, refDb, isBrickwall: false };
 
+  // Estimate ultrasonic noise floor using the lowest 10% of near-Nyquist bins
+  // and cap at -98 dB so genuine full-bandwidth 48kHz+ music never inflates the floor.
   let noiseFloorDb = -104;
-  if (nyquist >= 23500) {
-    const nfStart = Math.floor(22500 / binHz);
-    const nfEnd = Math.min(holdArr.length - 1, Math.floor((nyquist - 150) / binHz));
+  const nfLow = Math.max(nyquist - 1500, 22500);
+  if (nyquist >= 23500 && nfLow < nyquist - 50) {
+    const nfStart = Math.floor(nfLow / binHz);
+    const nfEnd = Math.min(holdArr.length - 1, Math.floor((nyquist - 40) / binHz));
     const nfVals = [];
-    for (let i = nfStart; i <= nfEnd; i++) nfVals.push(holdArr[i]);
+    for (let i = nfStart; i <= nfEnd; i++) {
+      nfVals.push(holdArr[i]);
+    }
     if (nfVals.length > 0) {
-      noiseFloorDb = Math.max(-115, Math.min(-88, percentile(nfVals, 0.5)));
+      noiseFloorDb = Math.max(-118, Math.min(-98, percentile(nfVals, 0.1)));
     }
   }
 
-  const floorThreshold = noiseFloorDb + 6.5;
-  const threshold = Math.max(refDb - 62, floorThreshold);
+  const floorThreshold = noiseFloorDb + 5.0;
+  const threshold = Math.max(refDb - 64, floorThreshold);
 
-  const stepHz = 200;
+  const stepHz = nyquist > 30000 ? 400 : 150;
   const bands = [];
 
   for (let f = 8000; f <= nyquist - stepHz; f += stepHz) {
     const bStart = Math.floor(f / binHz);
     const bEnd = Math.min(holdArr.length - 1, Math.floor((f + stepHz) / binHz));
     const slice = [];
-    for (let i = bStart; i <= bEnd; i++) slice.push(holdArr[i]);
+    for (let i = bStart; i <= bEnd; i++) {
+      slice.push(holdArr[i]);
+    }
     bands.push({ freq: f + stepHz / 2, db: percentile(slice, 0.8) });
   }
 
@@ -338,6 +347,7 @@ function detectCutoffHz(holdArr, sr) {
       return { cutoffHz, refDb, isBrickwall };
     }
   }
+
   return { cutoffHz: 8000, refDb, isBrickwall: true };
 }
 

@@ -117,25 +117,26 @@ function detectCutoffHz(holdArr, sr) {
   const refDb = percentile(midVals, 0.8);
   if (refDb < -72) return { cutoffHz: null, refDb, isBrickwall: false };
 
-  // Measure actual ultrasonic noise floor near Nyquist
+  // Estimate ultrasonic noise floor using the lowest 10% of near-Nyquist bins
+  // and cap at -98 dB so genuine full-bandwidth 48kHz+ music never inflates the floor.
   let noiseFloorDb = -104;
-  const nfLow = Math.max(nyquist - 1800, 22500);
-  if (nyquist >= 23500 && nfLow < nyquist - 200) {
+  const nfLow = Math.max(nyquist - 1500, 22500);
+  if (nyquist >= 23500 && nfLow < nyquist - 50) {
     const nfStart = Math.floor(nfLow / binHz);
-    const nfEnd = Math.min(holdArr.length - 1, Math.floor((nyquist - 150) / binHz));
+    const nfEnd = Math.min(holdArr.length - 1, Math.floor((nyquist - 40) / binHz));
     const nfVals = [];
     for (let i = nfStart; i <= nfEnd; i++) {
       nfVals.push(holdArr[i]);
     }
     if (nfVals.length > 0) {
-      noiseFloorDb = Math.max(-118, Math.min(-88, percentile(nfVals, 0.5)));
+      noiseFloorDb = Math.max(-118, Math.min(-98, percentile(nfVals, 0.1)));
     }
   }
 
-  const floorThreshold = noiseFloorDb + 6.5;
-  const threshold = Math.max(refDb - 62, floorThreshold);
+  const floorThreshold = noiseFloorDb + 5.0;
+  const threshold = Math.max(refDb - 64, floorThreshold);
 
-  const stepHz = nyquist > 30000 ? 400 : 200;
+  const stepHz = nyquist > 30000 ? 400 : 150;
   const bands = [];
 
   for (let f = 8000; f <= nyquist - stepHz; f += stepHz) {
